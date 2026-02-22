@@ -9,6 +9,81 @@ A slicer sees triangles. We see *what the geometry is*. Support decisions depend
 the structural role, display visibility, and fragility of each feature -- not just
 its overhang angle.
 
+## Why This Exists
+
+Auto-support in slicer software (Chitubox, Lychee, etc.) treats a model as an
+anonymous triangle mesh. It cannot know that a surface is a brick facade facing a
+layout aisle, or that a bottom edge will be sanded flat after assembly, or that
+a door opening means the ground-floor interior is visible. It will wreck detail
+surfaces with support forests and leave structural overhangs dangling.
+
+The LLM-driven pipeline replaces that with a conversation:
+
+1. **The user provides context the geometry can't encode.** Which wall faces the
+   aisle. Which wall faces the backdrop. Where doors are (and therefore where
+   interior detail is visible). What assembly method is planned. What post-
+   processing is acceptable (sanding, filling, painting).
+
+2. **The LLM inspects the model geometry via MCP** and combines that context with
+   the physical rules below to produce a print strategy -- not just support
+   placement, but potentially model splitting, reorientation, and registration
+   features.
+
+3. **The user reviews and adjusts.** The conversation is the design review.
+
+This is fundamentally different from parameter-tuning a slicer. The pipeline has
+access to semantic knowledge that no slicer can infer from mesh geometry alone.
+
+## Print Strategy Pipeline
+
+The full pipeline is broader than "add supports." For complex models (multi-wall
+buildings, assemblies), the pipeline includes model preparation:
+
+```
+1. Inspect model geometry (FreeCAD MCP)
+2. Receive context from user (which surfaces matter, layout placement,
+   post-processing plans, assembly method)
+3. Plan print strategy:
+   - Print as one piece, or split?
+   - If split: where? (along mortar lines, at floor breaks, at corners)
+   - What tilt angle per piece?
+   - Which faces get supports, which are untouchable?
+4. Modify model if needed:
+   - Split bodies along chosen planes
+   - Add registration features (pins/sockets, alignment tabs)
+   - Orient each piece for its print direction
+5. Per piece: classify faces -> generate supports -> build raft
+6. Export plate(s)
+```
+
+### Assembly-Aware Decisions
+
+Splitting and assembly strategy affects support strategy. Options that are
+painful by hand but straightforward via MCP:
+
+- **Split along mortar lines** so seams disappear into brick pattern
+- **Print non-display walls flat** (backdrop-facing wall doesn't need tilt)
+- **Separate stories** -- shorter walls warp less, fit smaller build plates
+- **Print corner columns separately** with registration pins, so each wall
+  panel can be oriented independently
+- **Add sacrificial tabs** at joints, trimmed after assembly
+- **Add sanding datum surfaces** -- a flat bottom edge that will be sanded
+  is a feature, not a defect; supports there are free
+
+### Context the User Provides
+
+The user tells the pipeline things that geometry alone cannot reveal:
+
+| Context | Effect on Strategy |
+|---------|--------------------|
+| "This wall faces the aisle" | Display surface -- zero support contact |
+| "This wall faces the backdrop" | Interior -- supports are acceptable |
+| "There's a door at ground level" | Bottom edge will be sanded; heavy supports OK |
+| "The interior is visible through windows" | Interior surface near windows becomes display |
+| "I'm painting this wall" | Paint hides small support marks; lighter touch OK |
+| "This joins to another piece at the corner" | Registration features needed; joint line is a seam |
+| "The roof hides the top edge" | Top edge roughness is acceptable |
+
 ## Print Orientation
 
 Orientation is chosen *before* supports. It determines what needs support at all.

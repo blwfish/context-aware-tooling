@@ -109,6 +109,57 @@ painful by hand but straightforward via MCP:
 - **Add sanding datum surfaces** -- a flat bottom edge that will be sanded
   is a feature, not a defect; supports there are free
 
+### Automated Split + Registration
+
+At scale (50-100+ buildings), manual splitting is a non-starter. The split
+operation is highly automatable because it is the same geometric operation
+every time:
+
+1. Choose a split plane (mortar line, floor break, corner)
+2. Boolean-cut the body into two halves
+3. Add tapered registration pins on one half, matching sockets on the other
+4. Both sides are cut from the same plane -- alignment is exact by construction
+
+What makes this painful by hand is getting pin and socket to align precisely
+across two separately-edited bodies. By machine, both sides derive from the
+same split plane and pin centers are deterministic offsets -- there is nothing
+to align manually.
+
+#### Pin/Socket Geometry (print-scale mm)
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Pin radius | 0.6 mm | Large enough to be structural, small enough for thin walls |
+| Pin height | 1.5 mm | Deep enough for positive location, short enough to not weaken wall |
+| Draft angle | 2 deg | Slight taper for press-fit insertion |
+| Socket clearance | 0.12 mm radial | Accounts for resin shrinkage + print tolerance on M7 Pro |
+| Pin spacing | ~15 mm along split edge | 2-4 pins per typical wall panel |
+| Edge margin | 3 mm inset from ends | Avoids thin-wall blowout at corners |
+
+The socket is slightly deeper than the pin (by the clearance amount) to
+provide bottoming room -- the pin seats on its taper, not on the socket
+floor.
+
+#### Split Plane Selection Heuristics
+
+The pipeline should prefer split planes that:
+
+1. **Coincide with mortar lines** -- the seam disappears into existing texture
+2. **Fall at floor breaks** -- natural horizontal split between stories
+3. **Avoid window openings** -- splitting through a window creates fragile
+   mullion fragments and alignment nightmares
+4. **Produce pieces that fit the target printer** at the preferred tilt angle
+5. **Keep structural features intact** -- don't split a lintel in half
+
+For a typical multi-bay building, the search is:
+- Identify mortar-line Y (or X) coordinates from the geometry
+- Filter to those that don't cross window openings
+- Pick the one(s) that produce pieces fitting the build volume at 18 deg tilt
+- If no single split works, try two splits (thirds)
+
+This is geometry inspection + constraint satisfaction -- exactly what the
+LLM can do by inspecting the model via MCP and reasoning about the options.
+
 ### Context the User Provides
 
 The user tells the pipeline things that geometry alone cannot reveal:

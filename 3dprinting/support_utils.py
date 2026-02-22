@@ -1,5 +1,6 @@
 """
-Context-aware support generation utilities for resin MSLA printing.
+Context-aware support generation and model preparation utilities for resin
+MSLA printing.
 
 Designed to be executed inside FreeCAD's Python environment via MCP.
 Implements the pipeline described in context-aware-supports.md.
@@ -10,6 +11,7 @@ Usage (from FreeCAD MCP execute_python):
     # Then call pipeline functions:
     classified = classify_faces(doc.getObject("MyWall").Shape, wall_normal, window_bounds)
     contacts = generate_support_points(shape, classified, ...)
+    pieces = split_model(shape, axis='y', position=45.0)
     ...
 
 All dimensions are in print-scale mm (not prototype scale).
@@ -43,6 +45,354 @@ BASE_PAD_HEIGHT = 0.5          # mm
 
 BOTTOM_SUPPORT_SPACING = 5.0   # mm along longest axis
 BOTTOM_SUPPORT_MIN_DEPTH = 3.0 # mm -- use front+back rows if depth exceeds this
+
+# Pin/socket registration
+PIN_RADIUS = 0.6               # mm -- pin outer radius at print scale
+PIN_HEIGHT = 1.5               # mm -- pin length (extends from split face)
+PIN_DRAFT_ANGLE = 2.0          # degrees -- slight taper for press-fit
+PIN_CLEARANCE = 0.12           # mm radial clearance for socket
+PIN_SPACING = 15.0             # mm default spacing along split edge
+PIN_EDGE_MARGIN = 3.0          # mm inset from ends of split edge
+
+
+# ---------------------------------------------------------------------------
+# Model Splitting & Registration
+# ---------------------------------------------------------------------------
+
+def split_model(shape, axis, position):
+    """
+    Split a shape into two halves at a plane perpendicular to the given axis.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        The shape to split.
+    axis : str
+        'x', 'y', or 'z' -- the axis perpendicular to the split plane.
+    position : float
+        Coordinate along that axis where the cut is made.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (negative_side, positive_side) -- the two halves.
+        negative_side has coords < position on the given axis;
+        positive_side has coords >= position.
+    """
+    bb = shape.BoundBox
+    # Build a cutting box that's oversized in all directions
+    pad = 5.0
+    dx = bb.XLength + 2 * pad
+    dy = bb.YLength + 2 * pad
+    dz = bb.ZLength + 2 * pad
+    ox = bb.XMin - pad
+    oy = bb.YMin - pad
+    oz = bb.ZMin - pad
+
+    if axis == 'x':
+        # Negative side: box from xmin to position
+        neg_box = Part.makeBox(position - ox, dy, dz, Vector(ox, oy, oz))
+        # Positive side: box from position to xmax
+        pos_box = Part.makeBox(ox + dx - position, dy, dz,
+                               Vector(position, oy, oz))
+    elif axis == 'y':
+        neg_box = Part.makeBox(dx, position - oy, dz, Vector(ox, oy, oz))
+        pos_box = Part.makeBox(dx, oy + dy - position, dz,
+                               Vector(ox, position, oz))
+    elif axis == 'z':
+        neg_box = Part.makeBox(dx, dy, position - oz, Vector(ox, oy, oz))
+        pos_box = Part.makeBox(dx, dy, oz + dz - position,
+                               Vector(ox, oy, position))
+    else:
+        raise ValueError(f"axis must be 'x', 'y', or 'z', got '{axis}'")
+
+    neg_half = shape.common(neg_box)
+    pos_half = shape.common(pos_box)
+
+    print(f"Split at {axis}={position:.1f}: "
+          f"neg={neg_half.BoundBox}, pos={pos_half.BoundBox}")
+    return neg_half, pos_half
+
+
+def _pin_positions_along_edge(shape, axis, split_pos, pin_axis):
+    """
+    Compute pin center positions along a split face.
+
+    Distributes pins at PIN_SPACING intervals along pin_axis, inset
+    from the edges of the split face.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        One of the split halves (used to get bounding box at the split face).
+    axis : str
+        The split axis ('x', 'y', or 'z').
+    split_pos : float
+        Coordinate of the split plane.
+    pin_axis : str
+        Axis along which to distribute pins. Must differ from split axis.
+        Typically the longest axis of the split face.
+
+    Returns
+    -------
+    list of Vector
+        Pin center positions on the split face.
+    """
+    bb = shape.BoundBox
+
+    # The split face is perpendicular to `axis`. Pins distribute along
+    # `pin_axis` and are centered on the remaining axis.
+    axes = {'x': 0, 'y': 1, 'z': 2}
+    remaining = [a for a in ['x', 'y', 'z'] if a != axis and a != pin_axis][0]
+
+    def _range(ax):
+        if ax == 'x': return bb.XMin, bb.XMax
+        if ax == 'y': return bb.YMin, bb.YMax
+        if ax == 'z': return bb.ZMin, bb.ZMax
+
+    pa_min, pa_max = _range(pin_axis)
+    ra_min, ra_max = _range(remaining)
+
+    # Distribute along pin_axis
+    span = pa_max - pa_min - 2 * PIN_EDGE_MARGIN
+    if span <= 0:
+        # Too short for pins
+        return []
+    count = max(2, int(span / PIN_SPACING) + 1)
+    if count == 1:
+        pa_positions = [(pa_min + pa_max) / 2.0]
+    else:
+        step = span / (count - 1)
+        pa_positions = [pa_min + PIN_EDGE_MARGIN + i * step
+                        for i in range(count)]
+
+    # Center on remaining axis
+    ra_center = (ra_min + ra_max) / 2.0
+
+    positions = []
+    for pa_val in pa_positions:
+        coords = {axis: split_pos, pin_axis: pa_val, remaining: ra_center}
+        positions.append(Vector(coords['x'], coords['y'], coords['z']))
+
+    return positions
+
+
+def make_pin(center, direction, radius=PIN_RADIUS, height=PIN_HEIGHT,
+             draft_deg=PIN_DRAFT_ANGLE):
+    """
+    Make a single tapered registration pin (truncated cone).
+
+    Parameters
+    ----------
+    center : Vector
+        Center of pin base (on the split face).
+    direction : Vector
+        Unit vector pointing away from the body (into the mating piece).
+    radius : float
+        Base radius.
+    height : float
+        Pin length.
+    draft_deg : float
+        Taper angle in degrees. Tip radius = radius - height * tan(draft).
+
+    Returns
+    -------
+    Part.Shape
+    """
+    tip_radius = max(0.1, radius - height * math.tan(math.radians(draft_deg)))
+    pin = Part.makeCone(radius, tip_radius, height,
+                        center, direction)
+    return pin
+
+
+def make_socket(center, direction, radius=PIN_RADIUS, height=PIN_HEIGHT,
+                draft_deg=PIN_DRAFT_ANGLE, clearance=PIN_CLEARANCE):
+    """
+    Make a single registration socket (hole matching a pin, with clearance).
+
+    The socket is a truncated cone slightly larger than the pin.
+
+    Parameters
+    ----------
+    center : Vector
+        Center of socket opening (on the split face).
+    direction : Vector
+        Unit vector pointing into the body (opposite of pin direction).
+    radius : float
+        Pin base radius (socket adds clearance).
+    height : float
+        Socket depth (slightly deeper than pin for bottoming clearance).
+    draft_deg : float
+        Taper angle matching pin.
+    clearance : float
+        Radial clearance added to socket.
+
+    Returns
+    -------
+    Part.Shape
+        Solid to be subtracted (boolean cut) from the body.
+    """
+    sock_radius = radius + clearance
+    tip_radius = max(0.1, radius - height * math.tan(math.radians(draft_deg)))
+    sock_tip = tip_radius + clearance
+    sock_height = height + clearance  # slightly deeper for bottoming room
+    socket = Part.makeCone(sock_radius, sock_tip, sock_height,
+                           center, direction)
+    return socket
+
+
+def add_registration(neg_half, pos_half, axis, split_pos, pin_axis=None):
+    """
+    Add pin/socket registration features to two split halves.
+
+    Pins protrude from the negative half into sockets cut into the
+    positive half.
+
+    Parameters
+    ----------
+    neg_half : Part.Shape
+        The side with coords < split_pos.
+    pos_half : Part.Shape
+        The side with coords >= split_pos.
+    axis : str
+        Split axis ('x', 'y', or 'z').
+    split_pos : float
+        Coordinate of split plane.
+    pin_axis : str or None
+        Axis along which to distribute pins. If None, auto-selects
+        the longest axis of the split face.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_with_pins, pos_with_sockets)
+    """
+    # Auto-select pin distribution axis (longest axis of split face)
+    if pin_axis is None:
+        candidates = [a for a in ['x', 'y', 'z'] if a != axis]
+        bb = neg_half.BoundBox
+        def _extent(a):
+            if a == 'x': return bb.XLength
+            if a == 'y': return bb.YLength
+            return bb.ZLength
+        pin_axis = max(candidates, key=_extent)
+
+    positions = _pin_positions_along_edge(neg_half, axis, split_pos, pin_axis)
+    if not positions:
+        print("Warning: no room for registration pins")
+        return neg_half, pos_half
+
+    # Direction vectors: pins grow from neg toward pos
+    axis_vec = {'x': Vector(1, 0, 0), 'y': Vector(0, 1, 0),
+                'z': Vector(0, 0, 1)}
+    pin_dir = axis_vec[axis]       # points into pos_half
+    sock_dir = axis_vec[axis]      # socket cut goes into pos_half body
+
+    pin_shapes = []
+    socket_shapes = []
+    for pos in positions:
+        pin_shapes.append(make_pin(pos, pin_dir))
+        socket_shapes.append(make_socket(pos, sock_dir))
+
+    # Fuse pins onto negative half
+    pin_compound = Part.Compound(pin_shapes)
+    neg_result = neg_half.fuse(pin_compound)
+
+    # Cut sockets from positive half
+    sock_compound = Part.Compound(socket_shapes)
+    pos_result = pos_half.cut(sock_compound)
+
+    print(f"Added {len(positions)} registration pin/socket pairs "
+          f"along {pin_axis} axis")
+    return neg_result, pos_result
+
+
+def split_and_register(shape, axis, position, pin_axis=None):
+    """
+    Split a shape and add registration features in one call.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        Model to split.
+    axis : str
+        Split axis ('x', 'y', or 'z').
+    position : float
+        Split coordinate.
+    pin_axis : str or None
+        Pin distribution axis (auto-selected if None).
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_with_pins, pos_with_sockets)
+    """
+    neg, pos = split_model(shape, axis, position)
+    return add_registration(neg, pos, axis, position, pin_axis)
+
+
+# ---------------------------------------------------------------------------
+# Build Volume Check
+# ---------------------------------------------------------------------------
+
+# Known printer build volumes (x, y, z) in mm
+PRINTER_VOLUMES = {
+    'm7_pro': (218.0, 123.0, 260.0),
+    'm7_max': (298.0, 164.0, 300.0),
+}
+
+
+def check_build_fit(shape, printer='m7_pro', margin=2.0):
+    """
+    Check if a shape (with supports/raft) fits a printer's build volume.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        The complete print (model + supports + raft).
+    printer : str
+        Printer key from PRINTER_VOLUMES.
+    margin : float
+        Safety margin from build volume edges.
+
+    Returns
+    -------
+    dict with keys:
+        'fits': bool
+        'model_size': (x, y, z)
+        'build_volume': (x, y, z)
+        'overflow': (dx, dy, dz) -- positive values mean doesn't fit
+    """
+    vol = PRINTER_VOLUMES.get(printer)
+    if vol is None:
+        raise ValueError(f"Unknown printer '{printer}'. "
+                         f"Known: {list(PRINTER_VOLUMES.keys())}")
+
+    bb = shape.BoundBox
+    model_size = (bb.XLength, bb.YLength, bb.ZLength)
+    available = (vol[0] - 2*margin, vol[1] - 2*margin, vol[2] - 2*margin)
+    overflow = (model_size[0] - available[0],
+                model_size[1] - available[1],
+                model_size[2] - available[2])
+    fits = all(o <= 0 for o in overflow)
+
+    status = "FITS" if fits else "DOES NOT FIT"
+    print(f"Build volume check ({printer}): {status}")
+    print(f"  Model:  {model_size[0]:.1f} x {model_size[1]:.1f} x "
+          f"{model_size[2]:.1f} mm")
+    print(f"  Volume: {vol[0]:.1f} x {vol[1]:.1f} x {vol[2]:.1f} mm")
+    if not fits:
+        axes = ['X', 'Y', 'Z']
+        for i, o in enumerate(overflow):
+            if o > 0:
+                print(f"  {axes[i]} overflow: {o:.1f}mm")
+
+    return {
+        'fits': fits,
+        'model_size': model_size,
+        'build_volume': vol,
+        'overflow': overflow,
+    }
 
 
 # ---------------------------------------------------------------------------

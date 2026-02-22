@@ -56,6 +56,45 @@ buildings, assemblies), the pipeline includes model preparation:
 6. Export plate(s)
 ```
 
+### Build Volume as Hard Constraint
+
+The build volume is not a preference -- it is a gate. The pipeline must check
+fit *before* optimizing orientation or support strategy.
+
+```
+1. Compute bounding box of model + raft + supports at candidate orientation
+2. Check against target printer build volume
+3. If it doesn't fit: split is mandatory, not optional
+```
+
+This interacts with tilt angle: tilting a model increases its footprint in
+one axis. A wall that fits upright may not fit tilted at the preferred 18
+degrees. The pipeline may need to:
+
+- **Reduce tilt angle** to fit, accepting worse peel characteristics
+- **Split the model** to allow the preferred tilt on smaller pieces
+- **Choose between printers** if multiple are available (M7 Pro: 218x123mm,
+  M7 Max: 298x164mm)
+
+Real examples at HO scale (1:87.1):
+
+| Model | Print-scale size | Fits M7 Pro? | Fits M7 Max? | Notes |
+|-------|-----------------|--------------|--------------|-------|
+| CWM secondary building (4x3x2 bays) | ~140x100mm | Yes | Yes | One piece, room to tilt |
+| CWM main building (7x5x3 bays) | ~240x160mm | No | Barely | Must minimize tilt or split |
+| Roundhouse long wall | ~280mm+ | No | Only at specific tilt | Tilt is dictated by fit, not preference |
+
+When fit dictates tilt, support strategy must adapt to whatever orientation
+the build volume forces. This is the opposite of the normal flow (choose
+orientation, then support). The pipeline must handle both directions:
+
+- **Preferred path:** choose best orientation -> verify fit -> support
+- **Constrained path:** determine what fits -> pick best orientation within
+  that constraint -> support accordingly
+
+Splitting is often the better answer. Two pieces printed at optimal tilt
+will outperform one piece crammed in at a compromise angle.
+
 ### Assembly-Aware Decisions
 
 Splitting and assembly strategy affects support strategy. Options that are

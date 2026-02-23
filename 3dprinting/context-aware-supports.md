@@ -292,27 +292,26 @@ Every face in the model is classified before support placement.
    M7 Pro at 0.049mm XY resolution, features below ~0.2mm won't resolve at all;
    0.2-0.6mm is the fragile zone.
 
-3. **Cosmetic vs structural overhang by area, depth, and pattern.** Two tests,
-   either of which classifies a face as cosmetic:
+3. **Cosmetic vs structural overhang by depth, then area.** Two sequential tests:
 
-   **Area test:** Brick courses produce hundreds/thousands of tiny overhang faces
-   (< 1mm² each) at regular Z intervals. A lintel produces a few larger overhang
-   faces (> 1mm²) at a specific Z.
-   - Regular Z spacing + small area + many faces = cosmetic (brick/clapboard)
-   - Irregular Z + larger area + few faces = structural (lintel/cornice)
+   **Depth test (primary):** After dual-axis tilt, brick course steps compress
+   to ~0.07-0.12mm depth (dims_sorted[0]). Structural overhangs (lintels,
+   bay bottoms) have larger depth that scales with wall thickness:
+   - 1.2mm walls -> ~0.3mm structural depth
+   - 2.0mm walls -> ~0.5mm structural depth
+   - 4.8mm walls -> ~1.5mm structural depth
 
-   **Depth test:** The overhang's projection depth (how far it sticks out
-   unsupported) is a better discriminator than area alone. Brick course steps
-   are ~0.3-0.4mm deep regardless of how wide (in X) the face is -- a 4mm-wide
-   brick step face has area 1.6mm² which exceeds the area threshold, but it's
-   still self-supporting because the overhang depth is tiny. Lintels are 4-5mm
-   deep (spanning the full wall thickness).
-   - Overhang depth < 1mm = cosmetic (self-supporting micro-feature)
-   - Overhang depth >= 1mm = structural (needs evaluation for support)
+   The threshold is **0.15mm** -- comfortably above brick steps and below
+   the smallest structural faces at any practical wall thickness.
+   - Overhang depth < 0.15mm = cosmetic (brick/clapboard step, always self-supporting)
+   - Overhang depth >= 0.15mm = proceed to area test
 
-   The depth test catches the case where a wide but shallow brick course face
-   exceeds the area threshold. Use the face bounding box's second-smallest
-   dimension as a proxy for overhang depth.
+   **Area test (secondary):** After the depth test filters brick steps, small
+   remaining overhangs (area < 1mm²) are cosmetic. Larger ones are structural.
+
+   The depth-first approach replaced an earlier OR-based test (depth < 1mm
+   OR area < 10mm²) that broke when wall thickness was reduced to 1.2mm,
+   pushing structural face depths below 0.5mm.
 
 4. **Mullion detection.** Window mullions are thin bars spanning openings:
    - Vertical mullion: thin in X and Y, tall in Z
@@ -385,12 +384,12 @@ Applied after orientation is chosen and surfaces are classified.
    (e.g., mullion cross-point) AND the feature would fail without it.
 3. **No support on cosmetic overhangs.** Brick courses, clapboard lips, etc.
    are self-supporting at print scale.
-4. **Support tip diameter ~0.5mm** for interior contacts. Larger tips leave
+4. **Support tip diameter ~0.8mm** for interior contacts. Larger tips leave
    marks, but interior surfaces are hidden after assembly. On display-adjacent
-   contacts (rare, only at structural junctions), use 0.3mm tips.
+   contacts (rare, only at structural junctions), use 0.5mm tips.
 5. **Supports must connect to raft or build plate**, never free-standing.
 6. **Raise model off raft.** The model must not rest directly on the raft.
-   Elevate 2-3mm so that *all* contact between model and raft is through
+   Elevate 2mm so that *all* contact between model and raft is through
    support tips. This allows supports to be removed after UV curing, when
    the resin is rigid and supports snap cleanly at the tip. Removing supports
    before curing (when the resin is still somewhat flexible) risks deforming
@@ -404,7 +403,7 @@ Applied after orientation is chosen and surfaces are classified.
 3. **Match support density to structural need.** A 14mm lintel span needs
    maybe 2 supports; a 50mm cornice needs more. Scale linearly with span,
    not with overhang area.
-4. **Taper supports.** Cone tip (0.25mm contact) -> column (0.7mm radius) ->
+4. **Taper supports.** Cone tip (0.4mm contact) -> column (0.7mm radius) ->
    base pad (1.5mm radius on raft). These dimensions are deliberately heavy
    to resist MSLA peel forces; the contact is on interior surfaces where
    marks are acceptable.
@@ -446,7 +445,7 @@ and the display surface is right there.
 6. **Bottom supports required.** Because the model is raised off the raft
    (see Hard Rule 6), the model's bottom face also needs supports. These
    are identical in geometry to other supports (tapered, cone-tipped) and
-   should be distributed across the bottom face at ~5mm intervals along
+   should be distributed across the bottom face at ~2mm intervals along
    the longest axis, with front and back rows if the face depth > 3mm.
 
 ## Implementation Notes
@@ -547,6 +546,57 @@ With dual-axis tilt (Z rotation added), the wall normal gains an X component
 but remains Y-dominant for Z-tilt angles < 15°. Example: front wall with
 X-tilt=18°, Z-tilt=8° gives normal ≈ (0.13, -0.94, 0.31) -- still
 overwhelmingly Y. The `interior_y_side` heuristic remains valid.
+
+### Snap-to-Face Validation (Parallelogram Problem)
+
+After dual-axis tilt, rectangular faces become parallelograms. Grid-based
+support placement uses the face bounding box, which is an axis-aligned
+rectangle that overestimates the actual face area. Contact points placed
+at grid intersections may fall outside the real face polygon.
+
+**Solution: per-face distToShape validation.** For each candidate contact
+point, check distance to the specific face it was generated from:
+
+```python
+pt = Part.Vertex(Vector(x, y, z))
+dist, pts, _info = face.distToShape(pt)
+if dist <= tolerance:      # on the face
+    return (x, y, z)
+if dist <= snap_limit:     # near the face -- snap to nearest point
+    nearest = pts[0][0]    # point ON the face (not pts[0][1] which is on the vertex)
+    # verify snap stays on interior side
+    if interior_y_side == 'max' and nearest.y < face.CenterOfGravity.y:
+        return None        # snapped to display side, reject
+    return (nearest.x, nearest.y, nearest.z)
+return None                # too far, reject
+```
+
+**Critical indexing:** `distToShape` returns `(dist, [(pt_on_face, pt_on_vertex), ...], info)`.
+Use `pts[0][0]` for the point on the face. `pts[0][1]` is the input point
+projected differently and is NOT what you want for snapping.
+
+**Performance:** Running `distToShape` against a large compound (288+ faces)
+crashes FreeCAD. Always run it on individual faces -- fast for simple quads.
+
+### Wall Thickness and Classification
+
+Thinning walls affects the cosmetic/structural classification. When the wall
+is tilted, the overhang depth of structural faces is approximately:
+
+    structural_depth ≈ wall_thickness × sin(tilt_angle)
+
+For 18° tilt: sin(18°) ≈ 0.309, so:
+- 4.8mm wall -> ~1.5mm structural depth
+- 2.0mm wall -> ~0.6mm structural depth
+- 1.2mm wall -> ~0.37mm structural depth
+
+The 0.15mm cosmetic threshold (see Classification Heuristics) accommodates
+all practical wall thicknesses down to ~0.5mm.
+
+**Mullion depth warning:** When thinning walls, check that mullions and
+transoms are within the new wall depth. Original mullions at Y=2.4-2.8mm
+are lost entirely when cutting to Y=1.2mm. Rebuild them at shallower depth
+(e.g., Y=0.4-1.2) after the cut.
 
 ### Binary STL Export
 

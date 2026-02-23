@@ -61,19 +61,19 @@ RAFT_MARGIN = 2.0              # mm beyond footprint
 RAFT_THICKNESS = 1.5           # mm
 RAFT_CHAMFER = 0.4             # mm
 
-MODEL_RAISE = 3.0              # mm to raise model off raft
+MODEL_RAISE = 2.0              # mm to raise model off raft
 
 # Dual-axis tilt defaults
 DEFAULT_X_TILT = 18.0          # degrees around X axis (peel reduction)
 DEFAULT_Z_TILT = 0.0           # degrees around Z axis (diagonal peel line)
 
-TIP_RADIUS = 0.25              # mm (contact point; 0.5mm diameter on interior)
+TIP_RADIUS = 0.4               # mm (contact point; 0.8mm diameter on interior)
 TIP_HEIGHT = 0.8               # mm (cone section; shorter = stiffer transition)
 COLUMN_RADIUS = 0.7            # mm (1.4mm diameter; resists peel-force buckling)
 BASE_PAD_RADIUS = 1.5          # mm (3.0mm diameter base pad)
 BASE_PAD_HEIGHT = 0.8          # mm (taller base for shear resistance)
 
-BOTTOM_SUPPORT_SPACING = 3.0   # mm along longest axis
+BOTTOM_SUPPORT_SPACING = 2.0   # mm along longest axis
 BOTTOM_SUPPORT_MIN_DEPTH = 3.0 # mm -- use front+back rows if depth exceeds this
 
 # Pin/socket registration

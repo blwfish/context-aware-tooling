@@ -735,10 +735,13 @@ def _classify_single_face(normal, bbox, area, dims_sorted,
                 return 'fragile'
 
         # Cosmetic vs structural overhang -- check BOTH area and depth.
-        # Overhang depth = second-smallest bbox dimension (the projection
-        # depth of the overhang). Brick course steps are ~0.4mm deep but
-        # can have area > 1mm² on wide bays; the depth test catches these.
-        overhang_depth = dims_sorted[1] if len(dims_sorted) > 1 else dims_sorted[0]
+        # Overhang depth = smallest bbox dimension (the actual projection
+        # depth of the overhang lip). Brick course steps are ~0.1-0.4mm
+        # in their thinnest dimension even when they span the full bay
+        # width and wall thickness. After tilt, dims_sorted[1] can be
+        # the wall thickness (~4.8mm), not the step depth. Using [0]
+        # correctly identifies brick steps as cosmetic.
+        overhang_depth = dims_sorted[0]
         if area < COSMETIC_AREA_MAX or overhang_depth < COSMETIC_DEPTH_MAX:
             return 'cosmetic_overhang'
         else:

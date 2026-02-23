@@ -214,11 +214,54 @@ Orientation is chosen *before* supports. It determines what needs support at all
 4. **Minimize unsupported span.** Between two orientations that are otherwise equal,
    prefer the one with shorter maximum unsupported horizontal distance.
 
+### Dual-Axis Tilt
+
+Single-axis tilt (X only) leaves the peel line parallel to brick courses and
+mullion axes. Adding a small Z-axis rotation (5-10 degrees) makes the peel line
+sweep diagonally across the wall, with several benefits:
+
+1. **Reduced instantaneous peel area.** The peel line crosses the wall at an angle
+   instead of hitting an entire brick course simultaneously. Peak peel force is
+   lower because less cross-section is being separated at once.
+
+2. **Cross-layer bonding for mullions.** Vertical mullions that were parallel to
+   layer lines now cross them at the Z-tilt angle. Each layer bonds across the
+   mullion width, dramatically increasing shear strength vs. the single-layer-
+   wide bond of zero-angle printing.
+
+3. **Staggered brick course overhangs.** Brick courses that were at uniform Z
+   (requiring all support at the same height) are now spread across a Z range.
+   The printer handles them as a gradual ramp rather than a sudden ledge.
+
+4. **Better resin drainage.** Diagonal orientation means no horizontal troughs
+   where resin can pool.
+
+**Angle selection:** 5-10 degrees is typical. Larger Z-tilt increases the
+footprint in both X and Y, potentially exceeding the build volume. The build
+volume check must account for the combined X+Z tilt envelope.
+
+**Rotation order:** X-axis tilt first (lean wall back), then Z-axis rotation
+(rotate in build plane). This matches the FreeCAD Rotation composition:
+`rot_z.multiply(rot_x)`.
+
+```python
+# Dual-axis tilt example:
+tilted = tilt_for_printing(shape, tilt_deg=18.0,
+                           display_faces_negative_y=True, z_tilt_deg=8.0)
+wall_normal = tilted_wall_outward_normal(18.0,
+                           display_faces_negative_y=True, z_tilt_deg=8.0)
+```
+
+The `interior_y_side` determination still applies -- the Y-dominant axis of the
+wall normal is preserved for small Z-tilt angles. Support placement uses the
+face's actual plane equation (via `_face_z_at_xy`) rather than Y-only
+interpolation, so Z heights are correct for any tilt combination.
+
 ### Orientation for Common Model Railroad Structures
 
 | Structure | Recommended Orientation | Rationale |
 |-----------|------------------------|-----------|
-| Building wall | Tilt back 15-20 deg, inner face toward plate | Brick/detail face unsupported; mullions get angled layers |
+| Building wall | X-tilt 15-20 deg + Z-tilt 5-10 deg, inner face toward plate | Brick/detail face unsupported; diagonal peel; mullions get cross-layer bonding |
 | Bridge/arch | Arch opening facing up or tilted | Soffit overhangs manageable; deck detail preserved |
 | Roof panel | Tilt ~30 deg from horizontal | Reduces peel area; ridge detail faces away from plate |
 | Cylindrical (tower, silo) | Axis 15-20 deg from vertical | Avoids flat cross-section at any layer |
@@ -499,6 +542,11 @@ The math: for a front wall with display at -Y, tilting by -18° around X
 rotates points so that Y' = Y*cos(t) - Z*sin(t). The interior surface
 (at higher Y in the original) maps to higher Y' after tilt. So
 interior_y_side='max' is correct for display_faces_negative_y=True.
+
+With dual-axis tilt (Z rotation added), the wall normal gains an X component
+but remains Y-dominant for Z-tilt angles < 15°. Example: front wall with
+X-tilt=18°, Z-tilt=8° gives normal ≈ (0.13, -0.94, 0.31) -- still
+overwhelmingly Y. The `interior_y_side` heuristic remains valid.
 
 ### Binary STL Export
 

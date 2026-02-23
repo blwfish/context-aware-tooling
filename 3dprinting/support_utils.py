@@ -9,9 +9,15 @@ Usage (from FreeCAD MCP execute_python):
     exec(open('/Volumes/Files/claude/tooling/3dprinting/support_utils.py').read())
 
     # Then call pipeline functions:
-    # Tilt wall for printing (interior toward plate):
+    # Tilt wall for printing -- single-axis (traditional):
     tilted = tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True)
     wall_normal = tilted_wall_outward_normal(18.0, display_faces_negative_y=True)
+
+    # Tilt wall for printing -- dual-axis (diagonal peel line):
+    tilted = tilt_for_printing(shape, tilt_deg=18.0,
+                               display_faces_negative_y=True, z_tilt_deg=8.0)
+    wall_normal = tilted_wall_outward_normal(18.0,
+                               display_faces_negative_y=True, z_tilt_deg=8.0)
 
     # Classify faces:
     classified = classify_faces(tilted, wall_normal)
@@ -56,6 +62,10 @@ RAFT_THICKNESS = 1.5           # mm
 RAFT_CHAMFER = 0.4             # mm
 
 MODEL_RAISE = 3.0              # mm to raise model off raft
+
+# Dual-axis tilt defaults
+DEFAULT_X_TILT = 18.0          # degrees around X axis (peel reduction)
+DEFAULT_Z_TILT = 0.0           # degrees around Z axis (diagonal peel line)
 
 TIP_RADIUS = 0.25              # mm (contact point; 0.5mm diameter on interior)
 TIP_HEIGHT = 0.8               # mm (cone section; shorter = stiffer transition)
@@ -811,19 +821,18 @@ def generate_lintel_supports(shape, classified, window_bounds,
     lintel_idx, lintel_info = lintel_faces[0]
     lintel_face = shape.Faces[lintel_idx]
     bb = lintel_info['bbox']
+    lintel_normal = lintel_face.normalAt(0.5, 0.5)
+    lintel_cog = lintel_face.CenterOfGravity
 
     print(f"Lintel face {lintel_idx}: area={lintel_info['area']:.1f} "
           f"X=[{bb.XMin:.1f},{bb.XMax:.1f}] "
           f"Y=[{bb.YMin:.1f},{bb.YMax:.1f}] "
           f"Z=[{bb.ZMin:.1f},{bb.ZMax:.1f}]")
 
-    # Build a Z-from-Y interpolation for the tilted lintel
-    # (assumes planar face, linear Z variation across Y)
-    def lintel_z(y):
-        if bb.YMax == bb.YMin:
-            return bb.ZMax
-        t = (y - bb.YMin) / (bb.YMax - bb.YMin)
-        return bb.ZMax - t * (bb.ZMax - bb.ZMin)
+    # Z interpolation using the face's plane equation.
+    # Works correctly for both single-axis and dual-axis tilt.
+    def lintel_z(x, y):
+        return _face_z_at_xy(lintel_normal, lintel_cog, x, y)
 
     # X positions: jamb edges + near mullion
     x_positions = [bb.XMin + 0.5, bb.XMax - 0.5]  # jamb corners
@@ -841,7 +850,7 @@ def generate_lintel_supports(shape, classified, window_bounds,
     contacts = []
     for x in x_positions:
         for y in y_positions:
-            z = lintel_z(y)
+            z = lintel_z(x, y)
             contacts.append((x, y, z))
 
     print(f"Generated {len(contacts)} lintel support points")
@@ -891,17 +900,19 @@ def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE,
     bottom_idx, bottom_info = bottom_candidates[0]
     bb = bottom_info['bbox']
 
+    bottom_face = shape.Faces[bottom_idx]
+    bottom_normal = bottom_face.normalAt(0.5, 0.5)
+    bottom_cog = bottom_face.CenterOfGravity
+
     print(f"Bottom face {bottom_idx}: area={bottom_info['area']:.1f} "
           f"X=[{bb.XMin:.1f},{bb.XMax:.1f}] "
           f"Y=[{bb.YMin:.1f},{bb.YMax:.1f}] "
           f"Z=[{bb.ZMin:.1f},{bb.ZMax:.1f}]")
 
-    # Z interpolation for tilted bottom
-    def bottom_z(y):
-        if bb.YMax == bb.YMin:
-            return bb.ZMax
-        t = (y - bb.YMin) / (bb.YMax - bb.YMin)
-        return bb.ZMax - t * (bb.ZMax - bb.ZMin)
+    # Z interpolation using the face's plane equation.
+    # Works correctly for both single-axis and dual-axis tilt.
+    def bottom_z(x, y):
+        return _face_z_at_xy(bottom_normal, bottom_cog, x, y)
 
     # X positions: distribute at ~BOTTOM_SUPPORT_SPACING intervals
     x_count = max(2, int(bb.XLength / BOTTOM_SUPPORT_SPACING) + 1)
@@ -936,7 +947,7 @@ def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE,
     contacts = []
     for x in x_positions:
         for y in y_positions:
-            z = bottom_z(y)
+            z = bottom_z(x, y)
             contacts.append((x, y, z))
 
     print(f"Generated {len(contacts)} bottom support points")
@@ -1002,12 +1013,13 @@ def generate_all_overhang_supports(shape, classified, wall_outward_normal,
         # no single midplane that works. The interior_y_side parameter
         # determines which Y edge to use; trust it.
 
-        # Z interpolation across the face (for tilted geometry)
-        def z_at_y(y, b=bb):
-            if b.YMax == b.YMin:
-                return b.ZMin
-            t = (y - b.YMin) / (b.YMax - b.YMin)
-            return b.ZMin + t * (b.ZMax - b.ZMin)
+        # Z interpolation using face plane equation (works for any tilt).
+        face = shape.Faces[idx]
+        face_n = face.normalAt(0.5, 0.5)
+        face_cog = face.CenterOfGravity
+
+        def z_at_xy(x, y, fn=face_n, fc=face_cog):
+            return _face_z_at_xy(fn, fc, x, y)
 
         if info['area'] >= area_threshold:
             # Large face (bottom/floor) -- grid of supports, dual Y-rows
@@ -1023,19 +1035,62 @@ def generate_all_overhang_supports(shape, classified, wall_outward_normal,
                 t = (i + 0.5) / x_count
                 x = bb.XMin + x_margin + t * (bb.XLength - 2 * x_margin)
                 for y_pos in y_positions_ovh:
-                    z = z_at_y(y_pos)
+                    z = z_at_xy(x, y_pos)
                     contacts.append((x, y_pos, z))
         else:
             # Lintel/feature -- supports at jamb corners only
             x_left = bb.XMin + 0.5
             x_right = bb.XMax - 0.5
             for x in [x_left, x_right]:
-                z = z_at_y(y_int)
+                z = z_at_xy(x, y_int)
                 contacts.append((x, y_int, z))
 
     print(f"Generated {len(contacts)} overhang support points "
           f"(all on {'YMin' if interior_y_side == 'min' else 'YMax'} / interior side)")
     return contacts
+
+
+# ---------------------------------------------------------------------------
+# Face Z Interpolation
+# ---------------------------------------------------------------------------
+
+def _face_z_at_xy(face_normal, face_cog, x, y):
+    """
+    Compute Z at (x, y) on a planar face using the plane equation.
+
+    For a plane with normal (nx, ny, nz) passing through (cx, cy, cz):
+        nx*(x-cx) + ny*(y-cy) + nz*(z-cz) = 0
+        z = cz - (nx*(x-cx) + ny*(y-cy)) / nz
+
+    Works correctly for any tilt combination (single-axis or dual-axis).
+    Falls back to face CoG's Z if the face is horizontal (nz ≈ 0 would
+    make the formula degenerate, but horizontal faces have constant Z).
+
+    Parameters
+    ----------
+    face_normal : Vector or tuple
+        Face normal from face.normalAt(0.5, 0.5).
+    face_cog : Vector or tuple
+        Face center of gravity from face.CenterOfGravity.
+    x, y : float
+        Position to evaluate.
+
+    Returns
+    -------
+    float
+        Z coordinate on the face plane at (x, y).
+    """
+    nx = face_normal.x if hasattr(face_normal, 'x') else face_normal[0]
+    ny = face_normal.y if hasattr(face_normal, 'y') else face_normal[1]
+    nz = face_normal.z if hasattr(face_normal, 'z') else face_normal[2]
+    cx = face_cog.x if hasattr(face_cog, 'x') else face_cog[0]
+    cy = face_cog.y if hasattr(face_cog, 'y') else face_cog[1]
+    cz = face_cog.z if hasattr(face_cog, 'z') else face_cog[2]
+
+    if abs(nz) < 1e-10:
+        # Face is vertical or near-vertical; Z doesn't vary with XY
+        return cz
+    return cz - (nx * (x - cx) + ny * (y - cy)) / nz
 
 
 # ---------------------------------------------------------------------------
@@ -1189,25 +1244,38 @@ def raise_model(shape, amount=MODEL_RAISE):
     return shape.translated(Vector(0, 0, amount))
 
 
-def tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True):
+def tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True,
+                      z_tilt_deg=0.0):
     """
     Tilt a wall for resin printing: interior toward plate, display away.
 
-    The wall is rotated around the X axis (bottom edge) so the interior
-    surface faces downward toward the build plate and the display surface
-    faces upward/away.
+    Applies up to two rotations:
+    1. **X-axis tilt** (primary): rotates the wall so its interior faces
+       the build plate. This is the traditional tilt (15-30 degrees).
+    2. **Z-axis tilt** (optional): rotates the wall in the XY plane so
+       the peel line sweeps diagonally across the wall instead of parallel
+       to layer lines. Benefits:
+       - Reduces instantaneous peel area (peel line crosses wall at angle)
+       - Gives mullions cross-layer bonding (layers cross the feature)
+       - Staggers brick course overhangs across Z heights
+       - Typical range: 5-10 degrees
 
-    After tilting, the shape is shifted so its lowest point is at Z=0.
+    Rotations are applied X-first, then Z, then shifted to Z=0.
 
     Parameters
     ----------
     shape : Part.Shape
         The wall shape (oriented with wall plane roughly in XZ, thin in Y).
     tilt_deg : float
-        Tilt angle in degrees (15-30 typical).
+        X-axis tilt angle in degrees (15-30 typical). Controls how far
+        the wall leans back (interior toward plate).
     display_faces_negative_y : bool
         If True, the display surface is at the -Y side of the wall
         (standard for front walls). If False, display is at +Y side.
+    z_tilt_deg : float
+        Z-axis rotation in degrees (0-15 typical). Rotates the wall
+        in the build plane for diagonal peel. Sign convention:
+        positive = CCW when viewed from above. Default 0 (no Z tilt).
 
     Returns
     -------
@@ -1217,10 +1285,18 @@ def tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True):
     # Interior toward plate means:
     # - If display is at -Y: rotate so top tilts toward +Y (negative angle)
     # - If display is at +Y: rotate so top tilts toward -Y (positive angle)
-    angle = -tilt_deg if display_faces_negative_y else tilt_deg
+    x_angle = -tilt_deg if display_faces_negative_y else tilt_deg
 
     import FreeCAD
-    rot = FreeCAD.Rotation(Vector(1, 0, 0), angle)
+
+    # Build combined rotation: X-tilt first, then Z-tilt
+    rot_x = FreeCAD.Rotation(Vector(1, 0, 0), x_angle)
+    if abs(z_tilt_deg) > 0.01:
+        rot_z = FreeCAD.Rotation(Vector(0, 0, 1), z_tilt_deg)
+        rot = rot_z.multiply(rot_x)  # apply X first, then Z
+    else:
+        rot = rot_x
+
     tilted = shape.copy()
     tilted.Placement = FreeCAD.Placement(Vector(0, 0, 0), rot)
 
@@ -1228,17 +1304,31 @@ def tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True):
     z_shift = -tilted.BoundBox.ZMin
     tilted = tilted.translated(Vector(0, 0, z_shift))
 
+    if abs(z_tilt_deg) > 0.01:
+        print(f"Tilted: X={x_angle:.1f}deg, Z={z_tilt_deg:.1f}deg "
+              f"(dual-axis), shifted Z+{z_shift:.1f}")
+    else:
+        print(f"Tilted: X={x_angle:.1f}deg, shifted Z+{z_shift:.1f}")
+
     return tilted
 
 
-def tilted_wall_outward_normal(tilt_deg=18.0, display_faces_negative_y=True):
+def tilted_wall_outward_normal(tilt_deg=18.0, display_faces_negative_y=True,
+                               z_tilt_deg=0.0):
     """
     Compute the wall outward (display) normal after tilting.
+
+    Applies the same rotation sequence as tilt_for_printing():
+    X-axis rotation first, then Z-axis rotation.
 
     Parameters
     ----------
     tilt_deg : float
+        X-axis tilt angle in degrees.
     display_faces_negative_y : bool
+        If True, display is at -Y (front wall convention).
+    z_tilt_deg : float
+        Z-axis rotation in degrees (0 = single-axis tilt).
 
     Returns
     -------
@@ -1250,11 +1340,21 @@ def tilted_wall_outward_normal(tilt_deg=18.0, display_faces_negative_y=True):
     if display_faces_negative_y:
         # Original normal (0, -1, 0), rotated -tilt_deg around X:
         # Y' = -cos(tilt), Z' = sin(tilt)
-        return Vector(0, -math.cos(tilt_rad), math.sin(tilt_rad))
+        nx, ny, nz = 0, -math.cos(tilt_rad), math.sin(tilt_rad)
     else:
         # Original normal (0, 1, 0), rotated +tilt_deg around X:
         # Y' = cos(tilt), Z' = -sin(tilt)
-        return Vector(0, math.cos(tilt_rad), -math.sin(tilt_rad))
+        nx, ny, nz = 0, math.cos(tilt_rad), -math.sin(tilt_rad)
+
+    # Apply Z rotation if specified
+    if abs(z_tilt_deg) > 0.01:
+        z_rad = math.radians(z_tilt_deg)
+        cz, sz = math.cos(z_rad), math.sin(z_rad)
+        nx2 = nx * cz - ny * sz
+        ny2 = nx * sz + ny * cz
+        nx, ny = nx2, ny2
+
+    return Vector(nx, ny, nz)
 
 
 def validate_tilt_direction(contact_points, shape, wall_outward_normal):

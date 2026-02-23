@@ -1,0 +1,3 @@
+# Large binary outputs
+models/*.stl
+models/*.3mf

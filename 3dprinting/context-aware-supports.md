@@ -443,8 +443,76 @@ The only operation that truly requires a boolean subtraction is cutting
 socket holes for registration. Minimize the cost by operating on the
 smallest possible geometry (one bay, not the whole panel).
 
-Use `execute_python_async` + `poll_job` for any operation that might
-exceed 30 seconds. The synchronous `execute_python` times out at 30s.
+**Always use `execute_python_async` + `poll_job` for boolean operations.**
+The synchronous `execute_python` times out at 30s and a timeout during a
+boolean can crash FreeCAD. Async has no timeout penalty -- just poll until
+done. The cost of polling is negligible compared to the cost of a crash
+and restart. Don't try to guess whether a boolean will be fast enough for
+sync; booleans on textured geometry are unpredictable.
+
+### transformShape vs transformGeometry
+
+When rotating or translating compound geometry (e.g., rotating a wall
+90 degrees for Left/Right orientation), **always use `transformShape`,
+never `transformGeometry`**.
+
+| Method | What it does | Performance |
+|--------|-------------|-------------|
+| `transformShape(matrix)` | Moves vertices directly | Instant, even on 14-solid compounds with 3700+ faces |
+| `transformGeometry(matrix)` | Recomputes all OCCT BRep surface definitions | Minutes to hang/crash on compounds; 280%+ CPU |
+
+`transformGeometry` is meant for operations that change the parametric
+definition of surfaces (e.g., non-uniform scaling). For rigid transforms
+(rotation, translation, uniform scaling), `transformShape` produces
+identical results with zero computational cost.
+
+```python
+# Correct: rotate a compound 90 degrees around Z
+mat = FreeCAD.Matrix()
+rad = math.radians(90)
+c, s = math.cos(rad), math.sin(rad)
+mat.A11 = c; mat.A12 = -s; mat.A21 = s; mat.A22 = c
+rotated = compound.copy()
+rotated.transformShape(mat)
+```
+
+### Interior Side Determination
+
+When tilting a wall for printing, the pipeline must know which side of
+the tilted geometry is interior (toward plate) vs display (away from
+plate). This depends on the wall's display orientation:
+
+| Wall | display_faces_negative_y | After tilt, interior is at... | interior_y_side |
+|------|-------------------------|-------------------------------|-----------------|
+| Front | True (display at -Y) | YMax | `'max'` |
+| Back | False (display at +Y) | YMin | `'min'` |
+| Left | True (after -90° Z rotation) | YMax | `'max'` |
+| Right | False (after +90° Z rotation) | YMin | `'min'` |
+
+The math: for a front wall with display at -Y, tilting by -18° around X
+rotates points so that Y' = Y*cos(t) - Z*sin(t). The interior surface
+(at higher Y in the original) maps to higher Y' after tilt. So
+interior_y_side='max' is correct for display_faces_negative_y=True.
+
+### Binary STL Export
+
+FreeCAD's `exportStl()` produces ASCII STL, which is 5-6x larger than
+binary. For compounds with millions of triangles (typical for textured
+walls + supports), use Python's `struct.pack` to write binary STL:
+
+```python
+import struct
+triangles = shape.tessellate(0.01)  # or use Mesh.Mesh
+with open(path, 'wb') as f:
+    f.write(b'\x00' * 80)  # header
+    f.write(struct.pack('<I', num_triangles))
+    for tri in triangles:
+        f.write(struct.pack('<12fH', *normal, *v0, *v1, *v2, 0))
+```
+
+Typical sizes for a 4-bay HO building wall with supports:
+- ASCII STL: 669MB - 1.4GB
+- Binary STL: 139MB - 307MB
 
 ### Prototype Scale
 

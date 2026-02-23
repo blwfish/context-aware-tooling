@@ -48,6 +48,8 @@ FRAGILE_THRESHOLD = 0.6        # mm -- features thinner than this are fragile
 COSMETIC_AREA_MAX = 1.0        # mm^2 -- overhang faces smaller than this are cosmetic
 COSMETIC_DEPTH_MAX = 1.0       # mm -- overhang depth shallower than this is cosmetic
 OVERHANG_DOT_THRESHOLD = -0.3  # normal.z below this = downward-facing overhang
+WALL_DOT_THRESHOLD = 0.7       # abs(dot with wall normal) above this = wall surface
+                                # 0.5 was too loose: brick step overhangs had dot ~0.59
 
 RAFT_MARGIN = 2.0              # mm beyond footprint
 RAFT_THICKNESS = 1.5           # mm
@@ -702,7 +704,7 @@ def _classify_single_face(normal, bbox, area, dims_sorted,
                 normal.y * wall_outward_normal.y +
                 normal.z * wall_outward_normal.z)
 
-    if abs(dot_wall) > 0.5:
+    if abs(dot_wall) > WALL_DOT_THRESHOLD:
         # Strongly aligned with wall normal -- this is a wall surface.
         # Check for brick_side (thin face) first.
         if dims_sorted[0] < FRAGILE_THRESHOLD:
@@ -1241,8 +1243,10 @@ def validate_tilt_direction(contact_points, shape, wall_outward_normal):
     """
     Verify that all support contacts are on the interior (non-display) side.
 
-    Checks that no support column would cross in front of the display
-    surface on its way down to the raft.
+    Projects each contact onto the wall_outward_normal axis and checks
+    that it falls on the interior (negative-projection) side relative to
+    the display surface. Works correctly with tilted multi-bay geometry
+    where a simple center_y threshold fails.
 
     Parameters
     ----------
@@ -1260,28 +1264,37 @@ def validate_tilt_direction(contact_points, shape, wall_outward_normal):
     n = Vector(wall_outward_normal)
     n.normalize()
 
-    # For each contact, check that it's on the interior side of the
-    # model's center plane. The display side is in the direction of
-    # wall_outward_normal from the center.
+    # Find the display-side extreme: the point on the shape with the
+    # largest projection onto wall_outward_normal = the outermost display
+    # surface coordinate.
     bb = shape.BoundBox
-    center_y = (bb.YMin + bb.YMax) / 2.0
+    # Project all 8 bbox corners onto n and find max (display side)
+    corners = [
+        Vector(bb.XMin, bb.YMin, bb.ZMin), Vector(bb.XMax, bb.YMin, bb.ZMin),
+        Vector(bb.XMin, bb.YMax, bb.ZMin), Vector(bb.XMax, bb.YMax, bb.ZMin),
+        Vector(bb.XMin, bb.YMin, bb.ZMax), Vector(bb.XMax, bb.YMin, bb.ZMax),
+        Vector(bb.XMin, bb.YMax, bb.ZMax), Vector(bb.XMax, bb.YMax, bb.ZMax),
+    ]
+    projections = [c.dot(n) for c in corners]
+    display_proj = max(projections)   # display surface = max projection
+    interior_proj = min(projections)  # interior extremity = min projection
+    midplane_proj = (display_proj + interior_proj) / 2.0
 
     bad = 0
     for cx, cy, cz in contact_points:
-        # Interior side = opposite to wall outward normal direction
-        # For display-at-negative-Y: interior is at more positive Y
-        # A contact is on display side if it's more negative Y than center
-        if n.y < 0:  # display faces -Y
-            if cy < center_y:
-                bad += 1
-        else:  # display faces +Y
-            if cy > center_y:
-                bad += 1
+        p = Vector(cx, cy, cz)
+        proj = p.dot(n)
+        # Contact should be on interior side (proj < midplane)
+        if proj > midplane_proj:
+            bad += 1
 
     if bad > 0:
-        print(f"WARNING: {bad}/{len(contact_points)} contacts on display side!")
+        print(f"WARNING: {bad}/{len(contact_points)} contacts on display side "
+              f"(proj range [{interior_proj:.1f}, {display_proj:.1f}], "
+              f"mid={midplane_proj:.1f})")
         return False
-    print(f"Tilt validation: all {len(contact_points)} contacts on interior side")
+    print(f"Tilt validation: all {len(contact_points)} contacts on interior side "
+          f"(proj range [{interior_proj:.1f}, {display_proj:.1f}])")
     return True
 
 

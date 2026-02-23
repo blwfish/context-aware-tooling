@@ -57,13 +57,13 @@ RAFT_CHAMFER = 0.4             # mm
 
 MODEL_RAISE = 3.0              # mm to raise model off raft
 
-TIP_RADIUS = 0.15              # mm (contact point)
-TIP_HEIGHT = 1.0               # mm (cone section)
-COLUMN_RADIUS = 0.4            # mm
-BASE_PAD_RADIUS = 1.0          # mm
-BASE_PAD_HEIGHT = 0.5          # mm
+TIP_RADIUS = 0.25              # mm (contact point; 0.5mm diameter on interior)
+TIP_HEIGHT = 0.8               # mm (cone section; shorter = stiffer transition)
+COLUMN_RADIUS = 0.7            # mm (1.4mm diameter; resists peel-force buckling)
+BASE_PAD_RADIUS = 1.5          # mm (3.0mm diameter base pad)
+BASE_PAD_HEIGHT = 0.8          # mm (taller base for shear resistance)
 
-BOTTOM_SUPPORT_SPACING = 5.0   # mm along longest axis
+BOTTOM_SUPPORT_SPACING = 3.0   # mm along longest axis
 BOTTOM_SUPPORT_MIN_DEPTH = 3.0 # mm -- use front+back rows if depth exceeds this
 
 # Pin/socket registration
@@ -917,10 +917,15 @@ def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE,
     # of the overhang face. We default to the side further from the
     # display surface.
     y_margin = 0.5
+    y_row_offset = 2.0  # second row 2mm inboard from edge row
     if interior_y_side == 'max':
         y_positions = [bb.YMax - y_margin]
+        if bb.YLength > BOTTOM_SUPPORT_MIN_DEPTH:
+            y_positions.append(bb.YMax - y_margin - y_row_offset)
     elif interior_y_side == 'min':
         y_positions = [bb.YMin + y_margin]
+        if bb.YLength > BOTTOM_SUPPORT_MIN_DEPTH:
+            y_positions.append(bb.YMin + y_margin + y_row_offset)
     else:
         # Fallback: use both rows if depth allows
         if bb.YLength > BOTTOM_SUPPORT_MIN_DEPTH:
@@ -992,6 +997,11 @@ def generate_all_overhang_supports(shape, classified, wall_outward_normal,
         else:
             y_int = bb.YMax - y_margin
 
+        # Note: projection-based display-side filtering was removed because
+        # multi-depth compounds (thin front bays + deep side returns) have
+        # no single midplane that works. The interior_y_side parameter
+        # determines which Y edge to use; trust it.
+
         # Z interpolation across the face (for tilted geometry)
         def z_at_y(y, b=bb):
             if b.YMax == b.YMin:
@@ -1000,13 +1010,21 @@ def generate_all_overhang_supports(shape, classified, wall_outward_normal,
             return b.ZMin + t * (b.ZMax - b.ZMin)
 
         if info['area'] >= area_threshold:
-            # Large face (bottom/floor) -- grid of supports
+            # Large face (bottom/floor) -- grid of supports, dual Y-rows
+            y_row_offset = 2.0
+            y_positions_ovh = [y_int]
+            if bb.YLength > BOTTOM_SUPPORT_MIN_DEPTH:
+                if interior_y_side == 'max':
+                    y_positions_ovh.append(y_int - y_row_offset)
+                else:
+                    y_positions_ovh.append(y_int + y_row_offset)
             x_count = max(2, int(bb.XLength / BOTTOM_SUPPORT_SPACING) + 1)
             for i in range(x_count):
                 t = (i + 0.5) / x_count
                 x = bb.XMin + x_margin + t * (bb.XLength - 2 * x_margin)
-                z = z_at_y(y_int)
-                contacts.append((x, y_int, z))
+                for y_pos in y_positions_ovh:
+                    z = z_at_y(y_pos)
+                    contacts.append((x, y_pos, z))
         else:
             # Lintel/feature -- supports at jamb corners only
             x_left = bb.XMin + 0.5

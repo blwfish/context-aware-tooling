@@ -342,8 +342,9 @@ Applied after orientation is chosen and surfaces are classified.
    (e.g., mullion cross-point) AND the feature would fail without it.
 3. **No support on cosmetic overhangs.** Brick courses, clapboard lips, etc.
    are self-supporting at print scale.
-4. **Support tip diameter <= 0.3mm** for any contact on the model. Larger tips
-   leave visible marks.
+4. **Support tip diameter ~0.5mm** for interior contacts. Larger tips leave
+   marks, but interior surfaces are hidden after assembly. On display-adjacent
+   contacts (rare, only at structural junctions), use 0.3mm tips.
 5. **Supports must connect to raft or build plate**, never free-standing.
 6. **Raise model off raft.** The model must not rest directly on the raft.
    Elevate 2-3mm so that *all* contact between model and raft is through
@@ -360,8 +361,10 @@ Applied after orientation is chosen and surfaces are classified.
 3. **Match support density to structural need.** A 14mm lintel span needs
    maybe 2 supports; a 50mm cornice needs more. Scale linearly with span,
    not with overhang area.
-4. **Taper supports.** Cone tip (0.15-0.3mm contact) -> column (0.4-0.8mm) ->
-   base pad (1.0-1.5mm on raft).
+4. **Taper supports.** Cone tip (0.25mm contact) -> column (0.7mm radius) ->
+   base pad (1.5mm radius on raft). These dimensions are deliberately heavy
+   to resist MSLA peel forces; the contact is on interior surfaces where
+   marks are acceptable.
 5. **Avoid support forests.** If a region needs > 1 support per 2mm², reconsider
    the print orientation instead.
 
@@ -417,7 +420,10 @@ from face centroids produces absurd density. The pipeline is:
 4. **Place supports per region** (1-3 per region based on span)
 5. **Snap to structural junctions** where possible
 6. **Raise model off raft** (2-3mm) and add bottom-face supports
-7. **Build raft** sized to model footprint + 2mm margin, chamfered bottom
+7. **Dual Y-rows** for bottom and large overhang faces: one row at interior
+   edge, second row 2mm inboard. Both on interior half. This resists
+   peel-force tipping (single row tips; two rows 2mm apart act as truss).
+8. **Build raft** sized to model footprint + 2mm margin, chamfered bottom
 
 ### Avoiding Boolean Operations
 

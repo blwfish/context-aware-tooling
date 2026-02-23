@@ -734,18 +734,19 @@ def _classify_single_face(normal, bbox, area, dims_sorted,
             if dims_sorted[0] < FRAGILE_THRESHOLD:
                 return 'fragile'
 
-        # Cosmetic vs structural overhang -- check BOTH area and depth.
-        # Overhang depth = smallest bbox dimension (the actual projection
-        # depth of the overhang lip). Brick course steps are ~0.1-0.4mm
-        # in their thinnest dimension even when they span the full bay
-        # width and wall thickness. After tilt, dims_sorted[1] can be
-        # the wall thickness (~4.8mm), not the step depth. Using [0]
-        # correctly identifies brick steps as cosmetic.
+        # Cosmetic vs structural overhang classification.
+        # Brick course steps have very thin depth after tilt (~0.07-0.12mm).
+        # Structural overhangs (lintels, bay bottoms) have larger depth
+        # (~0.3mm for 1.2mm walls, ~0.5mm for 2mm, ~1.5mm for 4.8mm).
+        # Threshold 0.15mm separates brick steps from structural faces
+        # across all practical wall thicknesses.
         overhang_depth = dims_sorted[0]
-        if area < COSMETIC_AREA_MAX or overhang_depth < COSMETIC_DEPTH_MAX:
+        if overhang_depth < 0.15:
+            # Brick course step -- always cosmetic
             return 'cosmetic_overhang'
-        else:
-            return 'structural_overhang'
+        if area < COSMETIC_AREA_MAX:
+            return 'cosmetic_overhang'
+        return 'structural_overhang'
 
     # --- Vertical / near-vertical faces ---
     if abs(nz) < 0.3:
@@ -951,7 +952,11 @@ def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE,
     for x in x_positions:
         for y in y_positions:
             z = bottom_z(x, y)
-            contacts.append((x, y, z))
+            # After dual-axis tilt, bbox overestimates face extent.
+            # Snap to nearest point on face if outside.
+            snapped = _snap_to_face(bottom_face, x, y, z, interior_y_side)
+            if snapped is not None:
+                contacts.append(snapped)
 
     print(f"Generated {len(contacts)} bottom support points")
     return contacts
@@ -1039,14 +1044,20 @@ def generate_all_overhang_supports(shape, classified, wall_outward_normal,
                 x = bb.XMin + x_margin + t * (bb.XLength - 2 * x_margin)
                 for y_pos in y_positions_ovh:
                     z = z_at_xy(x, y_pos)
-                    contacts.append((x, y_pos, z))
+                    # After dual-axis tilt, bbox overestimates face extent.
+                    # Snap to nearest point on face if outside.
+                    snapped = _snap_to_face(face, x, y_pos, z, interior_y_side)
+                    if snapped is not None:
+                        contacts.append(snapped)
         else:
             # Lintel/feature -- supports at jamb corners only
             x_left = bb.XMin + 0.5
             x_right = bb.XMax - 0.5
             for x in [x_left, x_right]:
                 z = z_at_xy(x, y_int)
-                contacts.append((x, y_int, z))
+                snapped = _snap_to_face(face, x, y_int, z, interior_y_side)
+                if snapped is not None:
+                    contacts.append(snapped)
 
     print(f"Generated {len(contacts)} overhang support points "
           f"(all on {'YMin' if interior_y_side == 'min' else 'YMax'} / interior side)")
@@ -1094,6 +1105,54 @@ def _face_z_at_xy(face_normal, face_cog, x, y):
         # Face is vertical or near-vertical; Z doesn't vary with XY
         return cz
     return cz - (nx * (x - cx) + ny * (y - cy)) / nz
+
+
+def _snap_to_face(face, x, y, z, interior_y_side='min', tolerance=0.5):
+    """
+    Validate a contact point against a face; snap to interior edge if outside.
+
+    After dual-axis tilt, rectangular faces become parallelograms whose
+    bounding boxes overestimate the actual face extent.  Grid-based contact
+    placement uses the bbox, so some points land outside the face polygon.
+
+    - Within tolerance: return point unchanged.
+    - Outside but within snap_limit (3mm): snap to nearest point on face,
+      but only if the snapped point stays on the interior half (prevents
+      contacts poking through to the display side).
+    - Beyond snap_limit or snapped to display side: discard (return None).
+
+    Parameters
+    ----------
+    face : Part.Face
+    x, y, z : float
+    interior_y_side : str
+        'min' or 'max' -- which Y side is interior.
+    tolerance : float
+        Points within this distance are accepted as-is.
+
+    Returns
+    -------
+    (x, y, z) tuple or None
+    """
+    snap_limit = 3.0
+    pt = Part.Vertex(Vector(x, y, z))
+    try:
+        dist, pts, _info = face.distToShape(pt)
+        if dist <= tolerance:
+            return (x, y, z)
+        if dist <= snap_limit and len(pts) > 0:
+            # pts is list of (point_on_face, point_on_vertex) pairs
+            nearest = pts[0][0]  # closest point on face
+            # Reject if snap moved contact past face center (display side).
+            cog_y = face.CenterOfGravity.y
+            if interior_y_side == 'min' and nearest.y > cog_y:
+                return None  # would land on display side
+            if interior_y_side == 'max' and nearest.y < cog_y:
+                return None  # would land on display side
+            return (nearest.x, nearest.y, nearest.z)
+        return None  # too far, discard
+    except Exception:
+        return (x, y, z)  # if check fails, keep original
 
 
 # ---------------------------------------------------------------------------

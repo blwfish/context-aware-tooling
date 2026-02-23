@@ -9,8 +9,25 @@ Usage (from FreeCAD MCP execute_python):
     exec(open('/Volumes/Files/claude/tooling/3dprinting/support_utils.py').read())
 
     # Then call pipeline functions:
-    classified = classify_faces(doc.getObject("MyWall").Shape, wall_normal, window_bounds)
-    contacts = generate_support_points(shape, classified, ...)
+    # Tilt wall for printing (interior toward plate):
+    tilted = tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True)
+    wall_normal = tilted_wall_outward_normal(18.0, display_faces_negative_y=True)
+
+    # Classify faces:
+    classified = classify_faces(tilted, wall_normal)
+
+    # Generate supports (interior side only):
+    contacts = generate_all_overhang_supports(tilted, classified, wall_normal, 'min')
+
+    # Validate, build, raft:
+    validate_tilt_direction(contacts, tilted, wall_normal)
+    supports = build_supports(contacts)
+    raft = build_raft(tilted, contact_points=contacts)
+
+    # Or use the full pipeline:
+    run_support_pipeline(doc, "MyWall", wall_normal, interior_y_side='min')
+
+    # Split models:
     pieces = split_model(shape, axis='y', position=45.0)
     ...
 
@@ -29,6 +46,7 @@ import math
 
 FRAGILE_THRESHOLD = 0.6        # mm -- features thinner than this are fragile
 COSMETIC_AREA_MAX = 1.0        # mm^2 -- overhang faces smaller than this are cosmetic
+COSMETIC_DEPTH_MAX = 1.0       # mm -- overhang depth shallower than this is cosmetic
 OVERHANG_DOT_THRESHOLD = -0.3  # normal.z below this = downward-facing overhang
 
 RAFT_MARGIN = 2.0              # mm beyond footprint
@@ -704,8 +722,12 @@ def _classify_single_face(normal, bbox, area, dims_sorted,
             if dims_sorted[0] < FRAGILE_THRESHOLD:
                 return 'fragile'
 
-        # Cosmetic vs structural overhang
-        if area < COSMETIC_AREA_MAX:
+        # Cosmetic vs structural overhang -- check BOTH area and depth.
+        # Overhang depth = second-smallest bbox dimension (the projection
+        # depth of the overhang). Brick course steps are ~0.4mm deep but
+        # can have area > 1mm² on wide bays; the depth test catches these.
+        overhang_depth = dims_sorted[1] if len(dims_sorted) > 1 else dims_sorted[0]
+        if area < COSMETIC_AREA_MAX or overhang_depth < COSMETIC_DEPTH_MAX:
             return 'cosmetic_overhang'
         else:
             return 'structural_overhang'
@@ -824,7 +846,8 @@ def generate_lintel_supports(shape, classified, window_bounds,
     return contacts
 
 
-def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE):
+def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE,
+                             interior_y_side=None):
     """
     Generate support contact points for the model's bottom face.
 
@@ -837,6 +860,9 @@ def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE):
     classified : dict from classify_faces()
     raise_amount : float
         How far the model was raised.
+    interior_y_side : str or None
+        'min' or 'max' -- which Y side of overhang faces is interior.
+        Determined by tilt direction. If None, uses both rows.
 
     Returns
     -------
@@ -883,12 +909,22 @@ def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE):
         t = (i + 0.5) / x_count
         x_positions.append(bb.XMin + x_margin + t * (bb.XLength - 2 * x_margin))
 
-    # Y positions
+    # Y positions -- INTERIOR SIDE ONLY
+    # The interior side depends on tilt direction. After correct tilt
+    # (interior toward plate), the interior is at the lower or higher Y
+    # of the overhang face. We default to the side further from the
+    # display surface.
     y_margin = 0.5
-    if bb.YLength > BOTTOM_SUPPORT_MIN_DEPTH:
-        y_positions = [bb.YMin + y_margin, bb.YMax - y_margin]
+    if interior_y_side == 'max':
+        y_positions = [bb.YMax - y_margin]
+    elif interior_y_side == 'min':
+        y_positions = [bb.YMin + y_margin]
     else:
-        y_positions = [(bb.YMin + bb.YMax) / 2.0]
+        # Fallback: use both rows if depth allows
+        if bb.YLength > BOTTOM_SUPPORT_MIN_DEPTH:
+            y_positions = [bb.YMin + y_margin, bb.YMax - y_margin]
+        else:
+            y_positions = [(bb.YMin + bb.YMax) / 2.0]
 
     contacts = []
     for x in x_positions:
@@ -897,6 +933,88 @@ def generate_bottom_supports(shape, classified, raise_amount=MODEL_RAISE):
             contacts.append((x, y, z))
 
     print(f"Generated {len(contacts)} bottom support points")
+    return contacts
+
+
+def generate_all_overhang_supports(shape, classified, wall_outward_normal,
+                                   interior_y_side='min'):
+    """
+    Generate support contact points for all structural overhangs.
+
+    Handles multi-bay walls: finds all structural overhang faces, separates
+    them into bottom faces (grid supports) and lintels/features (jamb-corner
+    supports), and places contacts on the interior side only.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        The tilted, raised model.
+    classified : dict from classify_faces()
+    wall_outward_normal : Vector
+        Points from interior toward display (in tilted frame).
+    interior_y_side : str
+        'min' or 'max' -- which Y side of overhang faces is interior.
+        After correct tilt (interior toward plate), this is 'min' if
+        display was originally at -Y, 'max' if display was at +Y.
+
+    Returns
+    -------
+    list of (x, y, z) tuples -- contact points.
+    """
+    contacts = []
+    y_margin = 0.5
+    x_margin = 1.5
+
+    # Collect structural overhangs
+    overhangs = []
+    for idx, info in classified.items():
+        if info['category'] != 'structural_overhang':
+            continue
+        overhangs.append((idx, info))
+
+    if not overhangs:
+        print("No structural overhangs found")
+        return contacts
+
+    # Separate by area: large faces are bottom/floor (grid supports),
+    # smaller faces are lintels (jamb-corner supports)
+    areas = [info['area'] for _, info in overhangs]
+    area_threshold = max(areas) * 0.5  # rough split
+
+    for idx, info in overhangs:
+        bb = info['bbox']
+
+        # Interior Y position
+        if interior_y_side == 'min':
+            y_int = bb.YMin + y_margin
+        else:
+            y_int = bb.YMax - y_margin
+
+        # Z interpolation across the face (for tilted geometry)
+        def z_at_y(y, b=bb):
+            if b.YMax == b.YMin:
+                return b.ZMin
+            t = (y - b.YMin) / (b.YMax - b.YMin)
+            return b.ZMin + t * (b.ZMax - b.ZMin)
+
+        if info['area'] >= area_threshold:
+            # Large face (bottom/floor) -- grid of supports
+            x_count = max(2, int(bb.XLength / BOTTOM_SUPPORT_SPACING) + 1)
+            for i in range(x_count):
+                t = (i + 0.5) / x_count
+                x = bb.XMin + x_margin + t * (bb.XLength - 2 * x_margin)
+                z = z_at_y(y_int)
+                contacts.append((x, y_int, z))
+        else:
+            # Lintel/feature -- supports at jamb corners only
+            x_left = bb.XMin + 0.5
+            x_right = bb.XMax - 0.5
+            for x in [x_left, x_right]:
+                z = z_at_y(y_int)
+                contacts.append((x, y_int, z))
+
+    print(f"Generated {len(contacts)} overhang support points "
+          f"(all on {'YMin' if interior_y_side == 'min' else 'YMax'} / interior side)")
     return contacts
 
 
@@ -1051,13 +1169,130 @@ def raise_model(shape, amount=MODEL_RAISE):
     return shape.translated(Vector(0, 0, amount))
 
 
+def tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True):
+    """
+    Tilt a wall for resin printing: interior toward plate, display away.
+
+    The wall is rotated around the X axis (bottom edge) so the interior
+    surface faces downward toward the build plate and the display surface
+    faces upward/away.
+
+    After tilting, the shape is shifted so its lowest point is at Z=0.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        The wall shape (oriented with wall plane roughly in XZ, thin in Y).
+    tilt_deg : float
+        Tilt angle in degrees (15-30 typical).
+    display_faces_negative_y : bool
+        If True, the display surface is at the -Y side of the wall
+        (standard for front walls). If False, display is at +Y side.
+
+    Returns
+    -------
+    Part.Shape
+        Tilted shape with bottom at Z=0.
+    """
+    # Interior toward plate means:
+    # - If display is at -Y: rotate so top tilts toward +Y (negative angle)
+    # - If display is at +Y: rotate so top tilts toward -Y (positive angle)
+    angle = -tilt_deg if display_faces_negative_y else tilt_deg
+
+    import FreeCAD
+    rot = FreeCAD.Rotation(Vector(1, 0, 0), angle)
+    tilted = shape.copy()
+    tilted.Placement = FreeCAD.Placement(Vector(0, 0, 0), rot)
+
+    # Shift so bottom at Z=0
+    z_shift = -tilted.BoundBox.ZMin
+    tilted = tilted.translated(Vector(0, 0, z_shift))
+
+    return tilted
+
+
+def tilted_wall_outward_normal(tilt_deg=18.0, display_faces_negative_y=True):
+    """
+    Compute the wall outward (display) normal after tilting.
+
+    Parameters
+    ----------
+    tilt_deg : float
+    display_faces_negative_y : bool
+
+    Returns
+    -------
+    Vector
+        Unit normal pointing from interior toward display surface,
+        in the tilted frame.
+    """
+    tilt_rad = math.radians(tilt_deg)
+    if display_faces_negative_y:
+        # Original normal (0, -1, 0), rotated -tilt_deg around X:
+        # Y' = -cos(tilt), Z' = sin(tilt)
+        return Vector(0, -math.cos(tilt_rad), math.sin(tilt_rad))
+    else:
+        # Original normal (0, 1, 0), rotated +tilt_deg around X:
+        # Y' = cos(tilt), Z' = -sin(tilt)
+        return Vector(0, math.cos(tilt_rad), -math.sin(tilt_rad))
+
+
+def validate_tilt_direction(contact_points, shape, wall_outward_normal):
+    """
+    Verify that all support contacts are on the interior (non-display) side.
+
+    Checks that no support column would cross in front of the display
+    surface on its way down to the raft.
+
+    Parameters
+    ----------
+    contact_points : list of (x, y, z)
+    shape : Part.Shape
+        The tilted model.
+    wall_outward_normal : Vector
+        Points from interior toward display.
+
+    Returns
+    -------
+    bool
+        True if all contacts are safe (interior side).
+    """
+    n = Vector(wall_outward_normal)
+    n.normalize()
+
+    # For each contact, check that it's on the interior side of the
+    # model's center plane. The display side is in the direction of
+    # wall_outward_normal from the center.
+    bb = shape.BoundBox
+    center_y = (bb.YMin + bb.YMax) / 2.0
+
+    bad = 0
+    for cx, cy, cz in contact_points:
+        # Interior side = opposite to wall outward normal direction
+        # For display-at-negative-Y: interior is at more positive Y
+        # A contact is on display side if it's more negative Y than center
+        if n.y < 0:  # display faces -Y
+            if cy < center_y:
+                bad += 1
+        else:  # display faces +Y
+            if cy > center_y:
+                bad += 1
+
+    if bad > 0:
+        print(f"WARNING: {bad}/{len(contact_points)} contacts on display side!")
+        return False
+    print(f"Tilt validation: all {len(contact_points)} contacts on interior side")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Full Pipeline
 # ---------------------------------------------------------------------------
 
 def run_support_pipeline(doc, object_name, wall_outward_normal,
                           window_bounds=None, mullion_x=None,
-                          raise_amount=MODEL_RAISE):
+                          raise_amount=MODEL_RAISE,
+                          interior_y_side=None):
     """
     Run the full context-aware support pipeline on a model.
 
@@ -1080,6 +1315,9 @@ def run_support_pipeline(doc, object_name, wall_outward_normal,
         X center of vertical mullion.
     raise_amount : float
         How far to raise model off raft.
+    interior_y_side : str or None
+        'min' or 'max' -- which Y side is interior after tilting.
+        If None, uses both sides (legacy behavior for single-bay).
 
     Returns
     -------
@@ -1110,16 +1348,31 @@ def run_support_pipeline(doc, object_name, wall_outward_normal,
         lintel_contacts = []
 
     bottom_contacts = generate_bottom_supports(raised_shape, classified,
-                                                raise_amount)
+                                                raise_amount,
+                                                interior_y_side)
     all_contacts.extend(bottom_contacts)
 
-    # 4. Build supports
+    # 3b. For multi-bay panels, also generate all overhang supports
+    overhang_contacts = generate_all_overhang_supports(
+        raised_shape, classified, wall_outward_normal,
+        interior_y_side or 'min')
+    # Deduplicate with any lintel/bottom contacts already generated
+    existing = set(all_contacts)
+    new_overhang = [c for c in overhang_contacts if c not in existing]
+    all_contacts.extend(new_overhang)
+
+    # 4. Validate tilt direction
+    if all_contacts:
+        validate_tilt_direction(all_contacts, raised_shape,
+                                wall_outward_normal)
+
+    # 5. Build supports
     if all_contacts:
         support_compound = build_supports(all_contacts)
         sup_obj = doc.addObject("Part::Feature", "Supports")
         sup_obj.Shape = support_compound
 
-    # 5. Build raft (sized to cover all support base pads)
+    # 6. Build raft (sized to cover all support base pads)
     raft_shape = build_raft(raised_shape, contact_points=all_contacts)
     raft_obj = doc.addObject("Part::Feature", "Raft")
     raft_obj.Shape = raft_shape
@@ -1131,4 +1384,6 @@ def run_support_pipeline(doc, object_name, wall_outward_normal,
         'classified': classified,
         'lintel_contacts': lintel_contacts,
         'bottom_contacts': bottom_contacts,
+        'overhang_contacts': new_overhang,
+        'all_contacts': all_contacts,
     }

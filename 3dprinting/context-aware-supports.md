@@ -160,6 +160,26 @@ For a typical multi-bay building, the search is:
 This is geometry inspection + constraint satisfaction -- exactly what the
 LLM can do by inspecting the model via MCP and reasoning about the options.
 
+#### Corner Joints (L-joints)
+
+When a rectangular building is split into wall panels at corners, the
+panels meet at 90-degree L-joints, not butt joints. Registration strategy
+differs:
+
+- **Butt joint** (wall split along a mortar line): flat faces meet.
+  Pin/socket registration is straightforward -- pins on one face,
+  sockets on the other.
+- **L-joint** (corner where two walls meet at 90 degrees): the walls
+  share a corner volume (wall_thickness x wall_thickness column). This
+  overlap region itself provides alignment in both axes. A dab of CA
+  glue is sufficient; pins/sockets are unnecessary for L-joints at
+  HO scale wall thicknesses (~5mm print scale).
+
+For centroid-based panel classification (no boolean splitting), both
+panels include the corner overlap volume. This is correct for printing --
+the slicer unions the overlap when each panel is sliced independently.
+At assembly, the corner region interlocks.
+
 ### Context the User Provides
 
 The user tells the pipeline things that geometry alone cannot reveal:
@@ -229,11 +249,27 @@ Every face in the model is classified before support placement.
    M7 Pro at 0.049mm XY resolution, features below ~0.2mm won't resolve at all;
    0.2-0.6mm is the fragile zone.
 
-3. **Cosmetic vs structural overhang by area and pattern.** Brick courses produce
-   hundreds/thousands of tiny overhang faces (< 1mm² each) at regular Z intervals.
-   A lintel produces a few larger overhang faces (> 1mm²) at a specific Z.
+3. **Cosmetic vs structural overhang by area, depth, and pattern.** Two tests,
+   either of which classifies a face as cosmetic:
+
+   **Area test:** Brick courses produce hundreds/thousands of tiny overhang faces
+   (< 1mm² each) at regular Z intervals. A lintel produces a few larger overhang
+   faces (> 1mm²) at a specific Z.
    - Regular Z spacing + small area + many faces = cosmetic (brick/clapboard)
    - Irregular Z + larger area + few faces = structural (lintel/cornice)
+
+   **Depth test:** The overhang's projection depth (how far it sticks out
+   unsupported) is a better discriminator than area alone. Brick course steps
+   are ~0.3-0.4mm deep regardless of how wide (in X) the face is -- a 4mm-wide
+   brick step face has area 1.6mm² which exceeds the area threshold, but it's
+   still self-supporting because the overhang depth is tiny. Lintels are 4-5mm
+   deep (spanning the full wall thickness).
+   - Overhang depth < 1mm = cosmetic (self-supporting micro-feature)
+   - Overhang depth >= 1mm = structural (needs evaluation for support)
+
+   The depth test catches the case where a wide but shallow brick course face
+   exceeds the area threshold. Use the face bounding box's second-smallest
+   dimension as a proxy for overhang depth.
 
 4. **Mullion detection.** Window mullions are thin bars spanning openings:
    - Vertical mullion: thin in X and Y, tall in Z
@@ -241,6 +277,59 @@ Every face in the model is classified before support placement.
    - Cross-intersection points (where H meets V) are the strongest locations
      on a mullion -- the only acceptable support contact point if support
      is absolutely necessary.
+
+## Tilt Direction and Support Geometry
+
+Getting tilt direction wrong is the single most catastrophic error the pipeline
+can make. Supports end up on the display surface instead of the interior.
+
+### Tilt Direction Rule
+
+**Interior toward plate, display away from plate.** For a building wall:
+
+- The wall's display surface (brick, clapboard, detail) faces UP and AWAY
+  from the build plate.
+- The wall's interior surface faces DOWN, TOWARD the build plate.
+- Supports attach to the interior (underside) and grow upward to the raft.
+
+For a front wall with display at Y=0 facing -Y, interior at Y=4.8 facing +Y:
+- **Correct:** rotate so the top tilts toward +Y (interior side). The wall
+  leans back, display face on top. Supports are below/behind on the interior.
+- **Wrong:** rotate so the top tilts toward -Y (display side). Display face
+  ends up underneath, supports would need to touch it.
+
+### Vertical Supports on Tilted Walls
+
+When the tilt is correct (interior toward plate), vertical supports work
+naturally for all features:
+
+- **Bottom face supports:** contact at wall base, short vertical columns
+  to raft. Always safe.
+- **Lintel/floor supports:** contact on the interior underside of the
+  overhang, vertical column drops to raft. Since the interior face tilts
+  downward, these contacts are "below" the wall in the Y direction.
+  The support column stays on the interior side at all heights because
+  the wall leans *away* from it.
+
+If tilt were reversed (display toward plate), a support contacting the
+interior side of a high lintel would need to cross *in front of* the
+display surface at lower heights to reach the raft. This is why tilt
+direction is critical -- it's not just about which surface gets marked,
+it determines whether vertical supports are geometrically feasible.
+
+### Tilt Direction Validation
+
+Before placing any supports, verify:
+
+```
+For each support contact point (x, y_contact, z_contact):
+  At all heights z from raft to z_contact:
+    y_display(z) = position of display surface at height z
+    Assert: y_contact is on the interior side of y_display(z)
+```
+
+If any contact fails this check, either the tilt direction is wrong or
+the contact point is on the wrong side of the wall.
 
 ## Support Placement Rules
 
@@ -304,7 +393,11 @@ and the display surface is right there.
    suction on initial peel from build plate.
 4. **Raft top surface** is the support attachment plane. All supports
    terminate on this surface.
-5. **Bottom supports required.** Because the model is raised off the raft
+5. **Raft sized to support footprint, not just model footprint.** The raft
+   must cover all support base pad positions, which may extend beyond the
+   model's bounding box (e.g., supports for high features on a tilted wall
+   land further back on the raft than the model's base).
+6. **Bottom supports required.** Because the model is raised off the raft
    (see Hard Rule 6), the model's bottom face also needs supports. These
    are identical in geometry to other supports (tapered, cone-tipped) and
    should be distributed across the bottom face at ~5mm intervals along
@@ -325,6 +418,33 @@ from face centroids produces absurd density. The pipeline is:
 5. **Snap to structural junctions** where possible
 6. **Raise model off raft** (2-3mm) and add bottom-face supports
 7. **Build raft** sized to model footprint + 2mm margin, chamfered bottom
+
+### Avoiding Boolean Operations
+
+Boolean operations (fuse, cut, removeSplitter) on textured building geometry
+are extremely expensive in OCCT. A 6-bay wall panel fuse+removeSplitter
+takes 3+ minutes; adding pin/socket booleans on top can crash FreeCAD.
+
+**Rule: use compounds, not booleans, wherever possible.**
+
+| Operation | Boolean needed? | Alternative |
+|-----------|----------------|-------------|
+| Combine bay solids into panel | No | `Part.makeCompound()` -- instant |
+| Add support columns to assembly | No | Compound -- slicer unions overlapping mesh |
+| Add registration pins | No | Compound -- pin overlaps panel, slicer unions it |
+| Cut registration sockets | **Yes** | Cut from single corner bay only (~260 faces), not fused panel (~1000+ faces) |
+| Split model at plane | **Yes** | Half-space boolean, but only on the original compound |
+
+For STL export, a compound of touching/overlapping solids produces valid
+mesh. The slicer treats all enclosed volume as filled. Internal shared
+faces between bays are harmless -- they don't affect the printed result.
+
+The only operation that truly requires a boolean subtraction is cutting
+socket holes for registration. Minimize the cost by operating on the
+smallest possible geometry (one bay, not the whole panel).
+
+Use `execute_python_async` + `poll_job` for any operation that might
+exceed 30 seconds. The synchronous `execute_python` times out at 30s.
 
 ### Prototype Scale
 

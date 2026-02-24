@@ -34,6 +34,78 @@ The LLM-driven pipeline replaces that with a conversation:
 This is fundamentally different from parameter-tuning a slicer. The pipeline has
 access to semantic knowledge that no slicer can infer from mesh geometry alone.
 
+## Module Structure
+
+```
+3dprinting/
+  support_utils.py          Importable toolkit: Contact dataclass, constants,
+                            face classification, geometry builders (build_tapered_support,
+                            build_supports, build_raft), tilt helpers, check_build_fit.
+                            ~1200 lines.
+  split_utils.py            Model splitting along arbitrary/axis-aligned planes,
+                            pin/socket registration features. Zero dependency on
+                            support generation code.
+  generate_building_print.py  Pipeline layer (SecondaryBuilding-specific).
+                            Orchestrates: orient -> contacts -> collisions ->
+                            supports -> clip -> raft -> export.
+                            Structured as functions called from main().
+  thin_walls.py             Wall thickness reduction utilities.
+  context-aware-supports.md This file.
+  tests/
+    conftest.py             FreeCAD skip marker + fixtures
+    test_contact.py         Contact dataclass (pure math, no FreeCAD)
+    test_geometry_math.py   Geometry helpers (pure math, no FreeCAD)
+```
+
+### Contact Dataclass
+
+All support contact points use the `Contact` dataclass (replaces ad-hoc tuples):
+
+```python
+@dataclass
+class Contact:
+    x: float; y: float; z: float        # tip position on model surface
+    nx: float = 0.0; ny: float = 0.0    # face normal (unit vector)
+    nz: float = -1.0
+    base_z: float = 0.0                 # 0 = raft-based, >0 = model-resting
+```
+
+Properties: `face_normal`, `position`, `is_model_resting`.
+
+### Support Geometry
+
+Each support is built by `build_tapered_support(contact, raft_top_z, include_base_pad)`:
+
+| Component | Geometry | Dimensions |
+|-----------|----------|------------|
+| Sphere tip | Sphere at contact point | radius = TIP_RADIUS (0.4mm) |
+| Angled neck | Tapered cone from tip toward column | height = NECK_HEIGHT (4mm), approach angle from face normal |
+| Column | Vertical cylinder from neck base to raft/base_z | radius = COLUMN_RADIUS (0.7mm) |
+| Base pad | Wide cylinder at raft surface | radius = BASE_PAD_RADIUS (1.5mm), height = BASE_PAD_HEIGHT (0.8mm) |
+
+For near-vertical faces (face normal z-component small), the neck approaches at an
+angle derived from the face normal, keeping the column clear of thin walls. For
+horizontal faces, the neck is vertical and merges with the column.
+
+Model-resting supports (`contact.base_z > 0`, `include_base_pad=False`) omit the
+base pad and start the column at `base_z` instead of `raft_top_z`.
+
+### Collision Detection and Panel Clipping
+
+The pipeline in `generate_building_print.py` adds two context-aware steps beyond
+basic overhang support:
+
+**Collision detection:** Each support column path is tested against all 32 wall
+panels. If a vertical column from the contact point to the raft would intersect
+a panel, the support is reclassified:
+- If a landing surface exists on the intersecting panel, the support becomes
+  "model-resting" (base_z set to the panel top surface).
+- If no landing surface exists, the support is skipped.
+
+**Panel clipping:** After supports are built, each shape is boolean-cut against
+wall panels and exterior slabs to prevent supports from protruding through walls.
+This handles the ~0.1mm penetration that occurs at wall edges after 4-axis rotation.
+
 ## Print Strategy Pipeline
 
 The full pipeline is broader than "add supports." For complex models (multi-wall
@@ -252,6 +324,12 @@ wall_normal = tilted_wall_outward_normal(18.0,
                            display_faces_negative_y=True, z_tilt_deg=8.0)
 ```
 
+**4-axis rotation (SecondaryBuilding):** Multi-wall buildings may need additional
+rotations before the X+Z tilt. The SecondaryBuilding uses: 90deg Z (reorient to
+fit build plate) -> 18deg X (peel tilt) -> 5deg Y (additional tilt axis) -> 2deg Z
+(fine diagonal peel). The `orient_model()` function in generate_building_print.py
+handles this as a sequence of `transformShape` calls.
+
 The `interior_y_side` determination still applies -- the Y-dominant axis of the
 wall normal is preserved for small Z-tilt angles. Support placement uses the
 face's actual plane equation (via `_face_z_at_xy`) rather than Y-only
@@ -403,10 +481,11 @@ Applied after orientation is chosen and surfaces are classified.
 3. **Match support density to structural need.** A 14mm lintel span needs
    maybe 2 supports; a 50mm cornice needs more. Scale linearly with span,
    not with overhang area.
-4. **Taper supports.** Cone tip (0.4mm contact) -> column (0.7mm radius) ->
-   base pad (1.5mm radius on raft). These dimensions are deliberately heavy
-   to resist MSLA peel forces; the contact is on interior surfaces where
-   marks are acceptable.
+4. **Taper supports with angled approach.** Sphere tip (0.4mm radius) ->
+   angled neck (4mm, follows face normal) -> vertical column (0.7mm radius) ->
+   base pad (1.5mm radius on raft). The angled neck keeps the column clear
+   of thin walls. These dimensions are deliberately heavy to resist MSLA
+   peel forces; the contact is on interior surfaces where marks are acceptable.
 5. **Avoid support forests.** If a region needs > 1 support per 2mm², reconsider
    the print orientation instead.
 
@@ -618,11 +697,15 @@ Typical sizes for a 4-bay HO building wall with supports:
 - ASCII STL: 669MB - 1.4GB
 - Binary STL: 139MB - 307MB
 
-### Prototype Scale
+### Scale Convention
 
-All modeling is at prototype (real-world) scale. For HO (1:87.1):
-- 0.3mm at print scale = 26.1mm prototype
-- 0.6mm at print scale = 52.3mm prototype
-- Mullion thresholds are in print-scale mm, not prototype
+The SecondaryBuilding model and all support generation code operate at **print
+scale** (mm as printed). The model in FreeCAD is already at 1:87.1 — a 90mm
+dimension in the FCStd is 90mm on the build plate. Do NOT apply 1/87.1 scaling
+at export.
 
-Export applies scale factor: `scale = 1/87.1 = 0.01148`
+All constants (TIP_RADIUS, COLUMN_RADIUS, etc.) are in print-scale mm.
+- 0.3mm = clapboard step depth at print scale
+- 0.6mm = fragile feature threshold
+- 4.8mm = prototype wall thickness at print scale (4.8mm printed)
+- 1.2mm = thinned wall thickness at print scale

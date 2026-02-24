@@ -2,40 +2,17 @@
 Context-aware support generation and model preparation utilities for resin
 MSLA printing.
 
-Designed to be executed inside FreeCAD's Python environment via MCP.
+Designed to be imported inside FreeCAD's Python environment.
 Implements the pipeline described in context-aware-supports.md.
 
-Usage (from FreeCAD MCP execute_python):
-    exec(open('/Volumes/Files/claude/tooling/3dprinting/support_utils.py').read())
+Usage (from FreeCAD MCP execute_python or generate_building_print.py):
+    from support_utils import (
+        Contact, build_tapered_support, build_supports, build_raft,
+        check_build_fit, classify_faces, tilt_for_printing,
+        tilted_wall_outward_normal, generate_all_overhang_supports,
+    )
 
-    # Then call pipeline functions:
-    # Tilt wall for printing -- single-axis (traditional):
-    tilted = tilt_for_printing(shape, tilt_deg=18.0, display_faces_negative_y=True)
-    wall_normal = tilted_wall_outward_normal(18.0, display_faces_negative_y=True)
-
-    # Tilt wall for printing -- dual-axis (diagonal peel line):
-    tilted = tilt_for_printing(shape, tilt_deg=18.0,
-                               display_faces_negative_y=True, z_tilt_deg=8.0)
-    wall_normal = tilted_wall_outward_normal(18.0,
-                               display_faces_negative_y=True, z_tilt_deg=8.0)
-
-    # Classify faces:
-    classified = classify_faces(tilted, wall_normal)
-
-    # Generate supports (interior side only):
-    contacts = generate_all_overhang_supports(tilted, classified, wall_normal, 'min')
-
-    # Validate, build, raft:
-    validate_tilt_direction(contacts, tilted, wall_normal)
-    supports = build_supports(contacts)
-    raft = build_raft(tilted, contact_points=contacts)
-
-    # Or use the full pipeline:
-    run_support_pipeline(doc, "MyWall", wall_normal, interior_y_side='min')
-
-    # Split models:
-    pieces = split_model(shape, axis='y', position=45.0)
-    ...
+For model splitting, see split_utils.py.
 
 All dimensions are in print-scale mm (not prototype scale).
 """
@@ -44,6 +21,57 @@ import Part
 import FreeCAD
 from FreeCAD import Vector
 import math
+import logging
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Contact dataclass — replaces ad-hoc tuples for support contact points
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Contact:
+    """A support contact point on the model surface.
+
+    Unifies the previously separate 3-tuple (x,y,z), 6-tuple (x,y,z,nx,ny,nz),
+    and 7-tuple (x,y,z,base_z,nx,ny,nz) representations.
+
+    Attributes
+    ----------
+    x, y, z : float
+        Contact point where support tip touches the model.
+    nx, ny, nz : float
+        Unit normal of the contact face (points away from solid surface).
+        Default (0, 0, -1) = downward-facing horizontal face.
+    base_z : float
+        Z coordinate where the support column starts.
+        0.0 = raft-based (column grows from raft top).
+        >0  = model-resting (column starts on another surface).
+    """
+    x: float
+    y: float
+    z: float
+    nx: float = 0.0
+    ny: float = 0.0
+    nz: float = -1.0
+    base_z: float = 0.0
+
+    @property
+    def face_normal(self):
+        """Face normal as a tuple (nx, ny, nz)."""
+        return (self.nx, self.ny, self.nz)
+
+    @property
+    def position(self):
+        """Contact position as a tuple (x, y, z)."""
+        return (self.x, self.y, self.z)
+
+    @property
+    def is_model_resting(self):
+        """True if this support rests on the model rather than the raft."""
+        return self.base_z > 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -77,506 +105,6 @@ BASE_PAD_HEIGHT = 0.8          # mm (taller base for shear resistance)
 
 BOTTOM_SUPPORT_SPACING = 2.0   # mm along longest axis
 BOTTOM_SUPPORT_MIN_DEPTH = 3.0 # mm -- use front+back rows if depth exceeds this
-
-# Pin/socket registration
-PIN_RADIUS = 0.6               # mm -- pin outer radius at print scale
-PIN_HEIGHT = 1.5               # mm -- pin length (extends from split face)
-PIN_DRAFT_ANGLE = 2.0          # degrees -- slight taper for press-fit
-PIN_CLEARANCE = 0.12           # mm radial clearance for socket
-PIN_SPACING = 15.0             # mm default spacing along split edge
-PIN_EDGE_MARGIN = 3.0          # mm inset from ends of split edge
-
-
-# ---------------------------------------------------------------------------
-# Model Splitting & Registration
-# ---------------------------------------------------------------------------
-
-def _plane_basis(normal):
-    """
-    Return two orthonormal vectors (u, v) perpendicular to normal.
-    """
-    n = Vector(normal)
-    n.normalize()
-    if abs(n.x) < 0.9:
-        ref = Vector(1, 0, 0)
-    else:
-        ref = Vector(0, 1, 0)
-    u = n.cross(ref)
-    u.normalize()
-    v = n.cross(u)
-    v.normalize()
-    return u, v
-
-
-def split_model_plane(shape, point, normal):
-    """
-    Split a shape into two halves along an arbitrary plane.
-
-    The plane is defined by a point on the plane and its normal vector.
-    The "positive" half is on the side the normal points toward.
-
-    Parameters
-    ----------
-    shape : Part.Shape
-        The shape to split.
-    point : Vector
-        A point on the split plane.
-    normal : Vector
-        Normal vector of the split plane. The positive half is on the
-        side this vector points toward.
-
-    Returns
-    -------
-    tuple of (Part.Shape, Part.Shape)
-        (negative_side, positive_side)
-    """
-    bb = shape.BoundBox
-    diag = math.sqrt(bb.XLength**2 + bb.YLength**2 + bb.ZLength**2)
-    half_size = diag + 10.0  # oversized to ensure full coverage
-
-    n = Vector(normal)
-    n.normalize()
-    u, v = _plane_basis(n)
-
-    # Build a large planar face on the split plane using explicit corners.
-    # This avoids Part.makePlane's internal UV convention issues.
-    p = Vector(point)
-    c1 = p - u * half_size - v * half_size
-    c2 = p + u * half_size - v * half_size
-    c3 = p + u * half_size + v * half_size
-    c4 = p - u * half_size + v * half_size
-    wire = Part.makePolygon([c1, c2, c3, c4, c1])
-    plane_face = Part.Face(wire)
-
-    # Create half-spaces using reference points on each side
-    ref_pos = p + n * 10.0
-    ref_neg = p - n * 10.0
-    hs_pos = plane_face.makeHalfSpace(ref_pos)
-    hs_neg = plane_face.makeHalfSpace(ref_neg)
-
-    neg_half = shape.common(hs_neg)
-    pos_half = shape.common(hs_pos)
-
-    print(f"Split at plane (point={point}, normal={n}): "
-          f"neg solids={len(neg_half.Solids)}, "
-          f"pos solids={len(pos_half.Solids)}")
-    return neg_half, pos_half
-
-
-def split_model(shape, axis, position):
-    """
-    Split a shape into two halves at a plane perpendicular to the given axis.
-
-    Convenience wrapper around split_model_plane for axis-aligned splits.
-
-    Parameters
-    ----------
-    shape : Part.Shape
-        The shape to split.
-    axis : str
-        'x', 'y', or 'z' -- the axis perpendicular to the split plane.
-    position : float
-        Coordinate along that axis where the cut is made.
-
-    Returns
-    -------
-    tuple of (Part.Shape, Part.Shape)
-        (negative_side, positive_side) -- the two halves.
-        negative_side has coords < position on the given axis;
-        positive_side has coords >= position.
-    """
-    axis_map = {
-        'x': (Vector(position, 0, 0), Vector(1, 0, 0)),
-        'y': (Vector(0, position, 0), Vector(0, 1, 0)),
-        'z': (Vector(0, 0, position), Vector(0, 0, 1)),
-    }
-    if axis not in axis_map:
-        raise ValueError(f"axis must be 'x', 'y', or 'z', got '{axis}'")
-
-    point, normal = axis_map[axis]
-    return split_model_plane(shape, point, normal)
-
-
-def _pin_positions_along_edge(shape, axis, split_pos, pin_axis):
-    """
-    Compute pin center positions along a split face.
-
-    Distributes pins at PIN_SPACING intervals along pin_axis, inset
-    from the edges of the split face.
-
-    Parameters
-    ----------
-    shape : Part.Shape
-        One of the split halves (used to get bounding box at the split face).
-    axis : str
-        The split axis ('x', 'y', or 'z').
-    split_pos : float
-        Coordinate of the split plane.
-    pin_axis : str
-        Axis along which to distribute pins. Must differ from split axis.
-        Typically the longest axis of the split face.
-
-    Returns
-    -------
-    list of Vector
-        Pin center positions on the split face.
-    """
-    bb = shape.BoundBox
-
-    # The split face is perpendicular to `axis`. Pins distribute along
-    # `pin_axis` and are centered on the remaining axis.
-    axes = {'x': 0, 'y': 1, 'z': 2}
-    remaining = [a for a in ['x', 'y', 'z'] if a != axis and a != pin_axis][0]
-
-    def _range(ax):
-        if ax == 'x': return bb.XMin, bb.XMax
-        if ax == 'y': return bb.YMin, bb.YMax
-        if ax == 'z': return bb.ZMin, bb.ZMax
-
-    pa_min, pa_max = _range(pin_axis)
-    ra_min, ra_max = _range(remaining)
-
-    # Distribute along pin_axis
-    span = pa_max - pa_min - 2 * PIN_EDGE_MARGIN
-    if span <= 0:
-        # Too short for pins
-        return []
-    count = max(2, int(span / PIN_SPACING) + 1)
-    if count == 1:
-        pa_positions = [(pa_min + pa_max) / 2.0]
-    else:
-        step = span / (count - 1)
-        pa_positions = [pa_min + PIN_EDGE_MARGIN + i * step
-                        for i in range(count)]
-
-    # Center on remaining axis
-    ra_center = (ra_min + ra_max) / 2.0
-
-    positions = []
-    for pa_val in pa_positions:
-        coords = {axis: split_pos, pin_axis: pa_val, remaining: ra_center}
-        positions.append(Vector(coords['x'], coords['y'], coords['z']))
-
-    return positions
-
-
-def make_pin(center, direction, radius=PIN_RADIUS, height=PIN_HEIGHT,
-             draft_deg=PIN_DRAFT_ANGLE):
-    """
-    Make a single tapered registration pin (truncated cone).
-
-    Parameters
-    ----------
-    center : Vector
-        Center of pin base (on the split face).
-    direction : Vector
-        Unit vector pointing away from the body (into the mating piece).
-    radius : float
-        Base radius.
-    height : float
-        Pin length.
-    draft_deg : float
-        Taper angle in degrees. Tip radius = radius - height * tan(draft).
-
-    Returns
-    -------
-    Part.Shape
-    """
-    tip_radius = max(0.1, radius - height * math.tan(math.radians(draft_deg)))
-    pin = Part.makeCone(radius, tip_radius, height,
-                        center, direction)
-    return pin
-
-
-def make_socket(center, direction, radius=PIN_RADIUS, height=PIN_HEIGHT,
-                draft_deg=PIN_DRAFT_ANGLE, clearance=PIN_CLEARANCE):
-    """
-    Make a single registration socket (hole matching a pin, with clearance).
-
-    The socket is a truncated cone slightly larger than the pin.
-
-    Parameters
-    ----------
-    center : Vector
-        Center of socket opening (on the split face).
-    direction : Vector
-        Unit vector pointing into the body (opposite of pin direction).
-    radius : float
-        Pin base radius (socket adds clearance).
-    height : float
-        Socket depth (slightly deeper than pin for bottoming clearance).
-    draft_deg : float
-        Taper angle matching pin.
-    clearance : float
-        Radial clearance added to socket.
-
-    Returns
-    -------
-    Part.Shape
-        Solid to be subtracted (boolean cut) from the body.
-    """
-    sock_radius = radius + clearance
-    tip_radius = max(0.1, radius - height * math.tan(math.radians(draft_deg)))
-    sock_tip = tip_radius + clearance
-    sock_height = height + clearance  # slightly deeper for bottoming room
-    socket = Part.makeCone(sock_radius, sock_tip, sock_height,
-                           center, direction)
-    return socket
-
-
-def _find_split_face(shape, plane_point, plane_normal, tol=0.1):
-    """
-    Find the face on a split half that lies on the split plane.
-
-    Looks for a planar face whose center is close to the split plane
-    and whose normal is parallel to the plane normal.
-
-    Returns the face, or None if not found.
-    """
-    n = Vector(plane_normal)
-    n.normalize()
-    for face in shape.Faces:
-        if face.Surface.TypeId != 'Part::GeomPlane':
-            continue
-        try:
-            fn = face.normalAt(0.5, 0.5)
-        except Exception:
-            continue
-        # Check normal is parallel (or anti-parallel) to split plane normal
-        dot = abs(fn.x * n.x + fn.y * n.y + fn.z * n.z)
-        if dot < 0.95:
-            continue
-        # Check face center is on the split plane
-        cog = face.CenterOfGravity
-        dist = abs((cog.x - plane_point.x) * n.x +
-                    (cog.y - plane_point.y) * n.y +
-                    (cog.z - plane_point.z) * n.z)
-        if dist < tol:
-            return face
-    return None
-
-
-def _pin_positions_on_face(face, plane_normal, spacing=PIN_SPACING,
-                            margin=PIN_EDGE_MARGIN):
-    """
-    Distribute pin positions across a split face.
-
-    Works with arbitrary planar faces, not just axis-aligned ones.
-    Uses the face's own in-plane basis vectors computed from the plane
-    normal, so diagonal and angled splits work correctly.
-
-    Distributes pins along the longer in-plane direction, centered
-    on the shorter direction.
-
-    Parameters
-    ----------
-    face : Part.Face
-        The planar split face.
-    plane_normal : Vector
-        Normal of the split plane (pin direction).
-    spacing : float
-        Target spacing between pins.
-    margin : float
-        Inset from face edges.
-
-    Returns
-    -------
-    list of Vector
-        Pin center positions on the split face.
-    """
-    n = Vector(plane_normal)
-    n.normalize()
-    u, v = _plane_basis(n)
-
-    # Get the face center of gravity as the origin for UV projection
-    cog = face.CenterOfGravity
-
-    # Project all face vertices onto the UV plane to find extent
-    verts = face.Vertexes
-    if len(verts) < 3:
-        return []
-
-    u_vals = []
-    v_vals = []
-    for vert in verts:
-        p = vert.Point
-        d = p - cog
-        u_vals.append(d.dot(u))
-        v_vals.append(d.dot(v))
-
-    u_min, u_max = min(u_vals), max(u_vals)
-    v_min, v_max = min(v_vals), max(v_vals)
-    u_span = u_max - u_min
-    v_span = v_max - v_min
-
-    # Distribute along the longer direction, center on shorter
-    if u_span >= v_span:
-        long_dir, long_min, long_max = u, u_min, u_max
-        short_dir, short_min, short_max = v, v_min, v_max
-    else:
-        long_dir, long_min, long_max = v, v_min, v_max
-        short_dir, short_min, short_max = u, u_min, u_max
-
-    long_span = long_max - long_min
-    span = long_span - 2 * margin
-    if span <= 0:
-        return []
-
-    count = max(2, int(span / spacing) + 1)
-    step = span / (count - 1) if count > 1 else 0
-    long_positions = [long_min + margin + i * step for i in range(count)]
-
-    short_center = (short_min + short_max) / 2.0
-
-    positions = []
-    for lv in long_positions:
-        pos = cog + long_dir * lv + short_dir * short_center
-        positions.append(pos)
-
-    return positions
-
-
-def add_registration_plane(neg_half, pos_half, plane_point, plane_normal):
-    """
-    Add pin/socket registration features to two split halves.
-
-    General-purpose version that works with any split plane orientation.
-    Pins protrude from the negative half into sockets cut into the
-    positive half.
-
-    Parameters
-    ----------
-    neg_half : Part.Shape
-        The side opposite to the plane normal.
-    pos_half : Part.Shape
-        The side the plane normal points toward.
-    plane_point : Vector
-        A point on the split plane.
-    plane_normal : Vector
-        Normal vector of the split plane (points from neg toward pos).
-
-    Returns
-    -------
-    tuple of (Part.Shape, Part.Shape)
-        (neg_with_pins, pos_with_sockets)
-    """
-    n = Vector(plane_normal)
-    n.normalize()
-
-    # Find the split face on the negative half to place pins on
-    split_face = _find_split_face(neg_half, plane_point, n)
-    if split_face is None:
-        # Fallback: try finding it on pos_half
-        split_face = _find_split_face(pos_half, plane_point, n)
-    if split_face is None:
-        print("Warning: could not find split face for pin placement")
-        return neg_half, pos_half
-
-    positions = _pin_positions_on_face(split_face, n)
-    if not positions:
-        print("Warning: no room for registration pins on split face")
-        return neg_half, pos_half
-
-    pin_dir = n  # pins grow from neg toward pos
-
-    pin_shapes = []
-    socket_shapes = []
-    for pos in positions:
-        pin_shapes.append(make_pin(pos, pin_dir))
-        socket_shapes.append(make_socket(pos, pin_dir))
-
-    # Fuse pins onto negative half
-    pin_compound = Part.Compound(pin_shapes)
-    neg_result = neg_half.fuse(pin_compound)
-
-    # Cut sockets from positive half
-    sock_compound = Part.Compound(socket_shapes)
-    pos_result = pos_half.cut(sock_compound)
-
-    print(f"Added {len(positions)} registration pin/socket pairs")
-    return neg_result, pos_result
-
-
-def add_registration(neg_half, pos_half, axis, split_pos, pin_axis=None):
-    """
-    Add pin/socket registration features to two axis-aligned split halves.
-
-    Convenience wrapper around add_registration_plane.
-
-    Parameters
-    ----------
-    neg_half : Part.Shape
-        The side with coords < split_pos.
-    pos_half : Part.Shape
-        The side with coords >= split_pos.
-    axis : str
-        Split axis ('x', 'y', or 'z').
-    split_pos : float
-        Coordinate of split plane.
-    pin_axis : str or None
-        Ignored (kept for backward compatibility). Pin distribution
-        axis is auto-detected from the split face geometry.
-
-    Returns
-    -------
-    tuple of (Part.Shape, Part.Shape)
-        (neg_with_pins, pos_with_sockets)
-    """
-    axis_map = {
-        'x': (Vector(split_pos, 0, 0), Vector(1, 0, 0)),
-        'y': (Vector(0, split_pos, 0), Vector(0, 1, 0)),
-        'z': (Vector(0, 0, split_pos), Vector(0, 0, 1)),
-    }
-    point, normal = axis_map[axis]
-    return add_registration_plane(neg_half, pos_half, point, normal)
-
-
-def split_and_register_plane(shape, point, normal):
-    """
-    Split a shape along an arbitrary plane and add registration features.
-
-    Parameters
-    ----------
-    shape : Part.Shape
-        Model to split.
-    point : Vector
-        A point on the split plane.
-    normal : Vector
-        Normal vector of the split plane.
-
-    Returns
-    -------
-    tuple of (Part.Shape, Part.Shape)
-        (neg_with_pins, pos_with_sockets)
-    """
-    neg, pos = split_model_plane(shape, point, normal)
-    return add_registration_plane(neg, pos, point, normal)
-
-
-def split_and_register(shape, axis, position, pin_axis=None):
-    """
-    Split a shape along an axis-aligned plane and add registration features.
-
-    Convenience wrapper for axis-aligned splits.
-
-    Parameters
-    ----------
-    shape : Part.Shape
-        Model to split.
-    axis : str
-        Split axis ('x', 'y', or 'z').
-    position : float
-        Split coordinate.
-    pin_axis : str or None
-        Ignored (kept for backward compatibility).
-
-    Returns
-    -------
-    tuple of (Part.Shape, Part.Shape)
-        (neg_with_pins, pos_with_sockets)
-    """
-    neg, pos = split_model(shape, axis, position)
-    return add_registration(neg, pos, axis, position)
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +211,8 @@ def classify_faces(shape, wall_outward_normal, window_bounds=None,
     for i, face in enumerate(shape.Faces):
         try:
             n = face.normalAt(0.5, 0.5)
-        except Exception:
+        except Exception as e:
+            logger.debug("normalAt failed for face: %s", e)
             n = Vector(0, 0, 0)
         bb = face.BoundBox
         area = face.Area
@@ -1153,7 +682,8 @@ def _snap_to_face(face, x, y, z, interior_y_side='min', tolerance=0.5):
                 return None  # would land on display side
             return (nearest.x, nearest.y, nearest.z)
         return None  # too far, discard
-    except Exception:
+    except Exception as e:
+        logger.debug("snap_to_face check failed: %s", e)
         return (x, y, z)  # if check fails, keep original
 
 
@@ -1161,48 +691,57 @@ def _snap_to_face(face, x, y, z, interior_y_side='min', tolerance=0.5):
 # Geometry Builders
 # ---------------------------------------------------------------------------
 
-def build_tapered_support(cx, cy, cz, raft_top_z=0.0, face_normal=None):
+def build_tapered_support(contact, raft_top_z=0.0, include_base_pad=True):
     """
     Build a single tapered support column with sphere tip.
 
-    If face_normal is provided, the taper+sphere approach along the face
-    normal direction (perpendicular to wall surface), minimizing the
-    cross-section through thin walls.  If None, approaches vertically.
-
-    Returns a list of Part.Shape objects (pad, column, taper, sphere).
-    Caller is responsible for combining into a compound.
+    If the contact has a non-default face normal, the taper+sphere approach
+    along the face normal direction (perpendicular to wall surface),
+    minimizing the cross-section through thin walls.  Otherwise, approaches
+    vertically.
 
     Parameters
     ----------
-    cx, cy, cz : float
-        Contact point (tip of support touches model here).
+    contact : Contact
+        Contact point and face normal.  If contact.base_z > 0 and
+        include_base_pad is False, the column starts at base_z
+        (model-resting support).
     raft_top_z : float
         Z coordinate of raft top surface.
-    face_normal : tuple (nx, ny, nz) or None
-        Unit normal of the contact face (points away from solid surface).
-        When provided, sphere is offset along this normal and taper is
-        angled to match.
+    include_base_pad : bool
+        If True, add a cylindrical base pad on the raft.  Set False for
+        model-resting supports where the pad would protrude through
+        thin walls.
 
     Returns
     -------
     list of Part.Shape
     """
+    cx, cy, cz = contact.x, contact.y, contact.z
     shapes = []
 
-    # Base pad on raft
-    pad = Part.makeCylinder(BASE_PAD_RADIUS, BASE_PAD_HEIGHT,
-                            Vector(cx, cy, raft_top_z), Vector(0, 0, 1))
-    shapes.append(pad)
+    # Determine column start Z
+    if not include_base_pad and contact.base_z > 0:
+        col_start_z = contact.base_z
+    else:
+        col_start_z = raft_top_z + BASE_PAD_HEIGHT
 
-    if face_normal is not None:
+    # Base pad on raft (skip for model-resting supports)
+    if include_base_pad:
+        pad = Part.makeCylinder(BASE_PAD_RADIUS, BASE_PAD_HEIGHT,
+                                Vector(cx, cy, raft_top_z), Vector(0, 0, 1))
+        shapes.append(pad)
+
+    fnx, fny, fnz = contact.face_normal
+    fn_len = math.sqrt(fnx*fnx + fny*fny + fnz*fnz)
+    has_normal = fn_len > 0.01 and not (fnx == 0 and fny == 0)
+
+    if has_normal:
+        # Normalize
+        fnx, fny, fnz = fnx/fn_len, fny/fn_len, fnz/fn_len
+
         # Angled approach: column stands at offset XY, neck sweeps along
         # face normal to reach the contact.  Like commercial slicers.
-        fnx, fny, fnz = face_normal
-        fn_len = math.sqrt(fnx*fnx + fny*fny + fnz*fnz)
-        if fn_len > 0.01:
-            fnx, fny, fnz = fnx/fn_len, fny/fn_len, fnz/fn_len
-        else:
-            fnx, fny, fnz = 0, 0, -1
 
         # Sphere center: contact + TIP_RADIUS along face normal
         sc = Vector(cx + TIP_RADIUS * fnx,
@@ -1217,15 +756,22 @@ def build_tapered_support(cx, cy, cz, raft_top_z=0.0, face_normal=None):
 
         # Column is vertical at neck_base XY position
         col_x, col_y = nb.x, nb.y
-        col_bot = raft_top_z + BASE_PAD_HEIGHT
+
+        # For raft-based supports with base pad, place pad at column XY
+        if include_base_pad:
+            # Override the pad position to be at the displaced column XY
+            shapes[0] = Part.makeCylinder(BASE_PAD_RADIUS, BASE_PAD_HEIGHT,
+                                          Vector(col_x, col_y, raft_top_z),
+                                          Vector(0, 0, 1))
+
         col_top = nb.z
-        if col_top > col_bot:
-            col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_bot,
-                                    Vector(col_x, col_y, col_bot),
+        if col_top > col_start_z:
+            col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_start_z,
+                                    Vector(col_x, col_y, col_start_z),
                                     Vector(0, 0, 1))
             shapes.append(col)
         else:
-            col_top = col_bot
+            col_top = col_start_z
 
         # Neck: angled cone from column top toward sphere center
         neck_start = Vector(col_x, col_y, col_top)
@@ -1239,15 +785,15 @@ def build_tapered_support(cx, cy, cz, raft_top_z=0.0, face_normal=None):
         sphere = Part.makeSphere(TIP_RADIUS, sc)
         shapes.append(sphere)
     else:
-        # Vertical approach (backward compatible)
-        col_bot = raft_top_z + BASE_PAD_HEIGHT
+        # Vertical approach (no meaningful XY face normal)
         col_top = cz - TIP_HEIGHT
-        if col_top > col_bot:
-            col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_bot,
-                                    Vector(cx, cy, col_bot), Vector(0, 0, 1))
+        if col_top > col_start_z:
+            col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_start_z,
+                                    Vector(cx, cy, col_start_z),
+                                    Vector(0, 0, 1))
             shapes.append(col)
         else:
-            col_top = col_bot
+            col_top = col_start_z
         taper_height = TIP_HEIGHT - TIP_RADIUS
         if taper_height > 0.01:
             taper = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, taper_height,
@@ -1260,13 +806,13 @@ def build_tapered_support(cx, cy, cz, raft_top_z=0.0, face_normal=None):
     return shapes
 
 
-def build_supports(contact_points, raft_top_z=0.0):
+def build_supports(contacts, raft_top_z=0.0):
     """
     Build all supports as a single compound.
 
     Parameters
     ----------
-    contact_points : list of (x, y, z) tuples
+    contacts : list of Contact
     raft_top_z : float
 
     Returns
@@ -1274,15 +820,15 @@ def build_supports(contact_points, raft_top_z=0.0):
     Part.Compound
     """
     all_shapes = []
-    for (cx, cy, cz) in contact_points:
-        all_shapes.extend(build_tapered_support(cx, cy, cz, raft_top_z))
+    for c in contacts:
+        all_shapes.extend(build_tapered_support(c, raft_top_z))
 
     compound = Part.Compound(all_shapes)
-    print(f"Built {len(contact_points)} supports ({len(all_shapes)} shapes)")
+    print(f"Built {len(contacts)} supports ({len(all_shapes)} shapes)")
     return compound
 
 
-def build_raft(shape, contact_points=None, margin=RAFT_MARGIN,
+def build_raft(shape, contacts=None, margin=RAFT_MARGIN,
                thickness=RAFT_THICKNESS, chamfer=RAFT_CHAMFER):
     """
     Build a raft under the model with chamfered bottom edges.
@@ -1294,8 +840,8 @@ def build_raft(shape, contact_points=None, margin=RAFT_MARGIN,
     ----------
     shape : Part.Shape
         The model shape (used to compute footprint).
-    contact_points : list of (x, y, z) or None
-        Support contact points. Raft extends to cover all base pads.
+    contacts : list of Contact or None
+        Support contacts.  Raft extends to cover all base pads.
     margin : float
         Extension beyond footprint.
     thickness : float
@@ -1315,12 +861,12 @@ def build_raft(shape, contact_points=None, margin=RAFT_MARGIN,
     y1 = bb.YMax
 
     # Expand to cover all support base pad positions
-    if contact_points:
-        for (cx, cy, cz) in contact_points:
-            x0 = min(x0, cx - BASE_PAD_RADIUS)
-            x1 = max(x1, cx + BASE_PAD_RADIUS)
-            y0 = min(y0, cy - BASE_PAD_RADIUS)
-            y1 = max(y1, cy + BASE_PAD_RADIUS)
+    if contacts:
+        for c in contacts:
+            x0 = min(x0, c.x - BASE_PAD_RADIUS)
+            x1 = max(x1, c.x + BASE_PAD_RADIUS)
+            y0 = min(y0, c.y - BASE_PAD_RADIUS)
+            y1 = max(y1, c.y + BASE_PAD_RADIUS)
 
     # Apply margin
     x0 -= margin
@@ -1339,8 +885,8 @@ def build_raft(shape, contact_points=None, margin=RAFT_MARGIN,
         if bottom_edges:
             try:
                 raft = raft.makeChamfer(chamfer, chamfer, bottom_edges)
-            except Exception:
-                pass  # chamfer can fail on degenerate geometry
+            except Exception as e:
+                logger.warning("Raft chamfer failed: %s", e)
 
     print(f"Raft: {x1-x0:.1f} x {y1-y0:.1f} x {thickness} "
           f"at Z=[{-thickness:.1f}, 0]")
@@ -1617,14 +1163,17 @@ def run_support_pipeline(doc, object_name, wall_outward_normal,
         validate_tilt_direction(all_contacts, raised_shape,
                                 wall_outward_normal)
 
-    # 5. Build supports
-    if all_contacts:
-        support_compound = build_supports(all_contacts)
+    # 5. Convert (x,y,z) tuples to Contact objects for build functions
+    contact_objs = [Contact(x=c[0], y=c[1], z=c[2]) for c in all_contacts]
+
+    # 6. Build supports
+    if contact_objs:
+        support_compound = build_supports(contact_objs)
         sup_obj = doc.addObject("Part::Feature", "Supports")
         sup_obj.Shape = support_compound
 
-    # 6. Build raft (sized to cover all support base pads)
-    raft_shape = build_raft(raised_shape, contact_points=all_contacts)
+    # 7. Build raft (sized to cover all support base pads)
+    raft_shape = build_raft(raised_shape, contacts=contact_objs)
     raft_obj = doc.addObject("Part::Feature", "Raft")
     raft_obj.Shape = raft_shape
 

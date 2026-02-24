@@ -128,7 +128,7 @@ def _collect_contacts(face, raw_contacts):
 
     # Y positions with EDGE_CLEAR clamping.
     # safe_y_min/max is the zone where the column fits without overlapping
-    # the face's YMin (display side) or YMax (interior wall side).
+    # the face's YMin or YMax adjacent wall surfaces.
     safe_y_min = fbb.YMin + EDGE_CLEAR
     safe_y_max = fbb.YMax - EDGE_CLEAR
 
@@ -159,7 +159,14 @@ def _collect_contacts(face, raw_contacts):
 
 
 # -- Main pass: wall-base faces (strongly downward-facing, n.z < -0.5) -------
-# These are the bottom edges of all four walls; n.z ≈ -0.95 after 18° tilt.
+# After 18° X-tilt, horizontal faces have n.z ≈ -0.95 and n.y ≈ +0.31.
+# This includes both the correct wall-base faces AND clapboard plank step
+# faces on the display side.  The display-face Y filter below removes the
+# clapboard step contacts after clustering.
+#
+# NOTE: a second "top-zone" pass (n.z in (-0.5, -0.2)) was tested but
+# proved to catch ONLY the clapboard exterior faces (n.y=-0.95, area up
+# to 810mm²) — i.e., every face in that range was wrong.  It was removed.
 for face in s5.Faces:
     try:
         n = face.normalAt(0.5, 0.5)
@@ -169,38 +176,7 @@ for face in s5.Faces:
         continue
     _collect_contacts(face, raw_contacts)
 
-print(f"Raw contacts after main pass: {len(raw_contacts)}")
-
-# -- Top-zone pass: shallower overhangs near the wall tops --------------------
-# After 18° X-tilt the interior faces of wall tops have n.z ≈ -0.31, which
-# is above THRESH=-0.5 and so missed by the main pass.  These faces are at
-# the highest Z values of the model; without support the wall edge furthest
-# from the raft warps during peel.
-#
-# Filter: n.z in (-0.50, -0.20] AND face center in top 30% of model height.
-# This catches interior/back wall faces near the top while excluding:
-#   - display face (n.z ≈ +0.31, above TOP_THRESH)
-#   - interior face of display wall (n.z ≈ +0.31, above TOP_THRESH)
-#   - main-pass faces already handled (n.z ≤ THRESH = -0.50)
-#
-TOP_THRESH   = -0.20
-Z_TOP_FRAC   = 0.70    # consider faces whose center is in the top 30% of height
-z_top_cutoff = model_bb.ZMin + Z_TOP_FRAC * model_bb.ZLength
-
-for face in s5.Faces:
-    if face.CenterOfMass.z < z_top_cutoff:
-        continue
-    try:
-        n = face.normalAt(0.5, 0.5)
-    except Exception:
-        continue
-    if n.z > TOP_THRESH:
-        continue           # upward-facing or near-horizontal → skip
-    if n.z <= THRESH:
-        continue           # already caught by main pass → skip
-    _collect_contacts(face, raw_contacts)
-
-print(f"Raw contacts after top-zone pass: {len(raw_contacts)}")
+print(f"Raw contacts: {len(raw_contacts)}")
 
 # Cluster to GRID cells — deduplicate, keep minimum-Z contact.
 # IMPORTANT: keep original (x, y, z) coordinates, NOT the grid cell center.
@@ -219,15 +195,23 @@ contacts = [
     for (cx, cy, cz) in cells.values()
 ]
 
-# Filter contacts too close to the display face (Y ≈ 0 after translation).
-# A column (radius COLUMN_RADIUS) centred at cy < DISPLAY_CLEARANCE would
-# extend into negative Y and physically intersect the clapboard surface.
-DISPLAY_CLEARANCE = COLUMN_RADIUS + 0.3   # 1.0mm from model YMin
+# Filter contacts too close to the display face.
+#
+# The display/clapboard face is at model_bb.YMax (≈118mm).  The interior/
+# plate side is at model_bb.YMin (≈0mm).  Contacts at high Y are either ON
+# the clapboard surface or inside the 1.2mm clapboard wall, where a support
+# column (r=0.7mm) would merge with or poke through the detail surface.
+#
+# Diagnostic confirmed: clapboard plank step faces in the main pass have
+# com.y up to 117.5mm (just 0.7mm from model_bb.YMax=118.2mm).  A 3.0mm
+# margin gives clearance from the clapboard wall interior face (~1.2mm
+# thick) plus the column radius (0.7mm) plus 1.1mm air gap.
+DISPLAY_Y_MAX_CLEAR = 3.0   # mm from model YMax (display/clapboard face)
 n_before = len(contacts)
 contacts = [(cx, cy, cz) for cx, cy, cz in contacts
-            if cy >= model_bb.YMin + DISPLAY_CLEARANCE]
+            if cy <= model_bb.YMax - DISPLAY_Y_MAX_CLEAR]
 print(f"Clustered contacts: {len(contacts)} "
-      f"({n_before - len(contacts)} dropped by display-clearance filter)")
+      f"({n_before - len(contacts)} dropped near display face)")
 
 # ---------------------------------------------------------------------------
 # Build supports and raft

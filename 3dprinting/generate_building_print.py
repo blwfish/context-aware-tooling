@@ -256,7 +256,7 @@ def _collect_contacts(face, raw_contacts, model_center_y, model_center_x):
             # Z from face plane equation: exact height at (x,y) on this face.
             z = com.z - (n.x / n.z) * (x - com.x) - (n.y / n.z) * (y - com.y)
             z = max(z, MODEL_RAISE + 0.1)
-            raw_contacts.append((x, y, z))
+            raw_contacts.append((x, y, z, n.x, n.y, n.z))
 
 
 # -- Main pass: wall-base faces (strongly downward-facing, n.z < -0.5) -------
@@ -280,20 +280,35 @@ print(f"Raw contacts: {len(raw_contacts)}")
 # IMPORTANT: keep original (x, y, z) coordinates, NOT the grid cell center.
 # Using the cell center would place supports off the face, giving wrong Z.
 cells = {}
-for (x, y, z) in raw_contacts:
+for (x, y, z, nx, ny, nz) in raw_contacts:
     key = (round(x / GRID) * GRID, round(y / GRID) * GRID)
     if key not in cells or z < cells[key][2]:
-        cells[key] = (x, y, z)
+        cells[key] = (x, y, z, nx, ny, nz)
 
 # Clip to model bbox — prevents clustering from pushing contacts outside.
 contacts = [
     (max(model_bb.XMin, min(model_bb.XMax, cx)),
      max(model_bb.YMin, min(model_bb.YMax, cy)),
-     cz)
-    for (cx, cy, cz) in cells.values()
+     cz, nx, ny, nz)
+    for (cx, cy, cz, nx, ny, nz) in cells.values()
 ]
 
-print(f"Clustered contacts: {len(contacts)}")
+# Nudge contacts toward model center (away from exterior surfaces).
+# Prevents column/sphere protrusion through thin walls, especially on
+# narrow faces where wall width (~1.0mm) ≈ column diameter (1.4mm).
+INWARD_NUDGE = 0.3   # mm shift toward building interior
+nudged = []
+for (cx, cy, cz, nx, ny, nz) in contacts:
+    dx = cx - center_x
+    dy = cy - center_y
+    d = math.sqrt(dx*dx + dy*dy)
+    if d > 0.01:
+        cx -= INWARD_NUDGE * dx / d
+        cy -= INWARD_NUDGE * dy / d
+    nudged.append((cx, cy, cz, nx, ny, nz))
+contacts = nudged
+
+print(f"Clustered contacts: {len(contacts)} (nudged {INWARD_NUDGE}mm inward)")
 
 # ---------------------------------------------------------------------------
 # Collision check: find per-contact base_z (raft or model-resting)
@@ -361,26 +376,30 @@ def _find_support_base(cx, cy, cz, col_radius):
     if max_z_hit < 0:
         return 0.0  # clear path to raft
     base_z = max_z_hit + MODEL_REST_GAP
-    # Sanity: base must be well below contact
-    if base_z > cz - TIP_HEIGHT - 1.0:
+    # Sanity: base must be below the neck-base Z position.
+    # For angled approach, neck_base_z ≈ cz + (TIP_RADIUS + NECK_HEIGHT) * nz
+    # where nz ≈ -0.95, so neck_base_z ≈ cz - 4.18.  The column needs at
+    # least 1mm below that.  Use conservative estimate.
+    min_neck_base_z = cz - (TIP_RADIUS + NECK_HEIGHT) * 0.95 - 1.0
+    if base_z > min_neck_base_z:
         return -1.0  # can't fit a support, skip this contact
     return base_z
 
 
 print(f"Checking {len(contacts)} support paths for model collisions "
       f"({len(_panels)} panels)...")
-raft_contacts = []       # (cx, cy, cz) — normal raft-based supports
-model_contacts = []      # (cx, cy, cz, base_z) — model-resting supports
+raft_contacts = []       # (cx, cy, cz, nx, ny, nz) — normal raft-based supports
+model_contacts = []      # (cx, cy, cz, base_z, nx, ny, nz) — model-resting supports
 skipped = 0
 
-for (cx, cy, cz) in contacts:
+for (cx, cy, cz, nx, ny, nz) in contacts:
     base_z = _find_support_base(cx, cy, cz, COLUMN_RADIUS)
     if base_z < 0:
         skipped += 1
     elif base_z < 0.1:
-        raft_contacts.append((cx, cy, cz))
+        raft_contacts.append((cx, cy, cz, nx, ny, nz))
     else:
-        model_contacts.append((cx, cy, cz, base_z))
+        model_contacts.append((cx, cy, cz, base_z, nx, ny, nz))
 
 print(f"  Raft-based: {len(raft_contacts)}, model-resting: {len(model_contacts)}, "
       f"skipped: {skipped}")
@@ -388,27 +407,65 @@ print(f"  Raft-based: {len(raft_contacts)}, model-resting: {len(model_contacts)}
 # ---------------------------------------------------------------------------
 # Build supports and raft
 # ---------------------------------------------------------------------------
-# Raft-based supports (normal)
-all_support_shapes = []
-for (cx, cy, cz) in raft_contacts:
-    all_support_shapes.extend(build_tapered_support(cx, cy, cz, raft_top_z=0.0))
 
-# Model-resting supports — column starts directly from model surface.
-# No separate base pad: BASE_PAD_RADIUS (1.5mm) is wider than the wall
-# thickness (~1.14mm after tilt), so a pad would protrude through the
-# exterior surface.  The column (COLUMN_RADIUS=0.7mm, 1.4mm dia) provides
-# adequate adhesion area on the model surface.
-for (cx, cy, cz, base_z) in model_contacts:
-    col_top = cz - TIP_HEIGHT
+def _angled_support(cx, cy, cz, base_z, nx, ny, nz):
+    """Build full angled support: column at offset XY + neck + sphere.
+
+    Column stands at the neck-base position (displaced along face normal),
+    starting from base_z.  Neck sweeps from column top toward contact.
+    """
+    shapes = []
+    fn_len = math.sqrt(nx*nx + ny*ny + nz*nz)
+    if fn_len < 0.01:
+        fn_len = 1.0
+    fnx, fny, fnz = nx/fn_len, ny/fn_len, nz/fn_len
+
+    # Sphere center: contact + TIP_RADIUS along face normal
+    sc = Vector(cx + TIP_RADIUS * fnx,
+                cy + TIP_RADIUS * fny,
+                cz + TIP_RADIUS * fnz)
+    # Neck base: NECK_HEIGHT below sphere, displaced toward interior in XY.
+    # Face normal XY points exterior; flip for interior approach.
+    nb = Vector(sc.x - NECK_HEIGHT * fnx,
+                sc.y - NECK_HEIGHT * fny,
+                sc.z + NECK_HEIGHT * fnz)
+
+    # Column at neck-base XY, from base_z to nb.z
+    col_x, col_y = nb.x, nb.y
+    col_top = nb.z
     if col_top > base_z:
         col = Part.makeCylinder(COLUMN_RADIUS, col_top - base_z,
-                                Vector(cx, cy, base_z), Vector(0, 0, 1))
-        all_support_shapes.append(col)
+                                Vector(col_x, col_y, base_z), Vector(0, 0, 1))
+        shapes.append(col)
     else:
         col_top = base_z
-    cone = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, TIP_HEIGHT,
-                         Vector(cx, cy, col_top), Vector(0, 0, 1))
-    all_support_shapes.append(cone)
+
+    # Neck: angled taper from column top toward sphere
+    neck_start = Vector(col_x, col_y, col_top)
+    nv = sc - neck_start
+    neck_len = nv.Length
+    if neck_len > 0.1:
+        neck_dir = Vector(nv.x / neck_len, nv.y / neck_len, nv.z / neck_len)
+        taper = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, neck_len,
+                              neck_start, neck_dir)
+        shapes.append(taper)
+    sphere = Part.makeSphere(TIP_RADIUS, sc)
+    shapes.append(sphere)
+    return shapes
+
+# Raft-based supports (normal)
+all_support_shapes = []
+for (cx, cy, cz, nx, ny, nz) in raft_contacts:
+    all_support_shapes.extend(
+        build_tapered_support(cx, cy, cz, raft_top_z=0.0,
+                              face_normal=(nx, ny, nz)))
+
+# Model-resting supports — column starts from model surface at offset XY.
+# No base pad (would protrude through thin wall).  Neck approaches along
+# face normal so column body is well clear of the thin wall.
+for (cx, cy, cz, base_z, nx, ny, nz) in model_contacts:
+    all_support_shapes.extend(
+        _angled_support(cx, cy, cz, base_z, nx, ny, nz))
 
 print(f"Built {len(raft_contacts) + len(model_contacts)} supports "
       f"({len(all_support_shapes)} shapes)")
@@ -495,9 +552,21 @@ print(f"Clipped {clip_count} support shapes (panel + exterior slab)")
 
 supports = Part.Compound(clipped_shapes)
 
-# Size raft from model footprint + raft-based support pads.
-# Model-resting supports don't touch the raft, so excluded.
-raft = build_raft(s5, contact_points=raft_contacts if raft_contacts else None)
+# Size raft from model footprint + raft-based support pad positions.
+# Pads are at displaced XY (neck-base position, not contact position).
+raft_pad_positions = []
+for (cx, cy, cz, nx, ny, nz) in raft_contacts:
+    fn_len = math.sqrt(nx*nx + ny*ny + nz*nz)
+    if fn_len > 0.01:
+        fnx, fny, fnz = nx/fn_len, ny/fn_len, nz/fn_len
+    else:
+        fnx, fny, fnz = 0, 0, -1
+    # Column is at interior XY: sphere + NECK_HEIGHT in flipped-XY direction
+    pad_x = cx + TIP_RADIUS * fnx - NECK_HEIGHT * fnx
+    pad_y = cy + TIP_RADIUS * fny - NECK_HEIGHT * fny
+    raft_pad_positions.append((pad_x, pad_y, cz))
+raft = build_raft(s5, contact_points=raft_pad_positions if raft_pad_positions else None,
+                  margin=1.0)  # reduced margin; displaced pads already extend beyond model
 raft_bb = raft.BoundBox
 print(f"Raft: {raft_bb.XLength:.1f} x {raft_bb.YLength:.1f} mm "
       f"(M7 Pro limit: 218 x 123 mm)")

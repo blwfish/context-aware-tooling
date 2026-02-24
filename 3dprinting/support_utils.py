@@ -68,7 +68,9 @@ DEFAULT_X_TILT = 18.0          # degrees around X axis (peel reduction)
 DEFAULT_Z_TILT = 0.0           # degrees around Z axis (diagonal peel line)
 
 TIP_RADIUS = 0.4               # mm (contact point; 0.8mm diameter on interior)
-TIP_HEIGHT = 0.8               # mm (cone section; shorter = stiffer transition)
+TIP_HEIGHT = 0.8               # mm (vertical tip transition; used when no face_normal)
+NECK_HEIGHT = 4.0              # mm (angled approach section; long taper keeps column
+                                #     clear of thin walls — like commercial slicers)
 COLUMN_RADIUS = 0.7            # mm (1.4mm diameter; resists peel-force buckling)
 BASE_PAD_RADIUS = 1.5          # mm (3.0mm diameter base pad)
 BASE_PAD_HEIGHT = 0.8          # mm (taller base for shear resistance)
@@ -1159,11 +1161,15 @@ def _snap_to_face(face, x, y, z, interior_y_side='min', tolerance=0.5):
 # Geometry Builders
 # ---------------------------------------------------------------------------
 
-def build_tapered_support(cx, cy, cz, raft_top_z=0.0):
+def build_tapered_support(cx, cy, cz, raft_top_z=0.0, face_normal=None):
     """
-    Build a single tapered support column.
+    Build a single tapered support column with sphere tip.
 
-    Returns a list of Part.Shape objects (pad, column, cone).
+    If face_normal is provided, the taper+sphere approach along the face
+    normal direction (perpendicular to wall surface), minimizing the
+    cross-section through thin walls.  If None, approaches vertically.
+
+    Returns a list of Part.Shape objects (pad, column, taper, sphere).
     Caller is responsible for combining into a compound.
 
     Parameters
@@ -1172,6 +1178,10 @@ def build_tapered_support(cx, cy, cz, raft_top_z=0.0):
         Contact point (tip of support touches model here).
     raft_top_z : float
         Z coordinate of raft top surface.
+    face_normal : tuple (nx, ny, nz) or None
+        Unit normal of the contact face (points away from solid surface).
+        When provided, sphere is offset along this normal and taper is
+        angled to match.
 
     Returns
     -------
@@ -1184,20 +1194,68 @@ def build_tapered_support(cx, cy, cz, raft_top_z=0.0):
                             Vector(cx, cy, raft_top_z), Vector(0, 0, 1))
     shapes.append(pad)
 
-    # Column
-    col_bot = raft_top_z + BASE_PAD_HEIGHT
-    col_top = cz - TIP_HEIGHT
-    if col_top > col_bot:
-        col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_bot,
-                                Vector(cx, cy, col_bot), Vector(0, 0, 1))
-        shapes.append(col)
-    else:
-        col_top = col_bot  # degenerate case: no column section
+    if face_normal is not None:
+        # Angled approach: column stands at offset XY, neck sweeps along
+        # face normal to reach the contact.  Like commercial slicers.
+        fnx, fny, fnz = face_normal
+        fn_len = math.sqrt(fnx*fnx + fny*fny + fnz*fnz)
+        if fn_len > 0.01:
+            fnx, fny, fnz = fnx/fn_len, fny/fn_len, fnz/fn_len
+        else:
+            fnx, fny, fnz = 0, 0, -1
 
-    # Cone tip
-    cone = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, TIP_HEIGHT,
-                         Vector(cx, cy, col_top), Vector(0, 0, 1))
-    shapes.append(cone)
+        # Sphere center: contact + TIP_RADIUS along face normal
+        sc = Vector(cx + TIP_RADIUS * fnx,
+                    cy + TIP_RADIUS * fny,
+                    cz + TIP_RADIUS * fnz)
+        # Neck base: NECK_HEIGHT below the sphere, displaced toward building
+        # INTERIOR in XY.  Face normal XY points toward exterior (away from
+        # solid), so flip XY to get interior direction.  Keep Z (downward).
+        nb = Vector(sc.x - NECK_HEIGHT * fnx,
+                    sc.y - NECK_HEIGHT * fny,
+                    sc.z + NECK_HEIGHT * fnz)
+
+        # Column is vertical at neck_base XY position
+        col_x, col_y = nb.x, nb.y
+        col_bot = raft_top_z + BASE_PAD_HEIGHT
+        col_top = nb.z
+        if col_top > col_bot:
+            col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_bot,
+                                    Vector(col_x, col_y, col_bot),
+                                    Vector(0, 0, 1))
+            shapes.append(col)
+        else:
+            col_top = col_bot
+
+        # Neck: angled cone from column top toward sphere center
+        neck_start = Vector(col_x, col_y, col_top)
+        nv = sc - neck_start
+        neck_len = nv.Length
+        if neck_len > 0.1:
+            neck_dir = Vector(nv.x/neck_len, nv.y/neck_len, nv.z/neck_len)
+            taper = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, neck_len,
+                                  neck_start, neck_dir)
+            shapes.append(taper)
+        sphere = Part.makeSphere(TIP_RADIUS, sc)
+        shapes.append(sphere)
+    else:
+        # Vertical approach (backward compatible)
+        col_bot = raft_top_z + BASE_PAD_HEIGHT
+        col_top = cz - TIP_HEIGHT
+        if col_top > col_bot:
+            col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_bot,
+                                    Vector(cx, cy, col_bot), Vector(0, 0, 1))
+            shapes.append(col)
+        else:
+            col_top = col_bot
+        taper_height = TIP_HEIGHT - TIP_RADIUS
+        if taper_height > 0.01:
+            taper = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, taper_height,
+                                  Vector(cx, cy, col_top), Vector(0, 0, 1))
+            shapes.append(taper)
+        sphere = Part.makeSphere(TIP_RADIUS,
+                                 Vector(cx, cy, cz - TIP_RADIUS))
+        shapes.append(sphere)
 
     return shapes
 

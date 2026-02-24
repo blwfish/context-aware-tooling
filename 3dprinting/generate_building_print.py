@@ -388,20 +388,19 @@ all_support_shapes = []
 for (cx, cy, cz) in raft_contacts:
     all_support_shapes.extend(build_tapered_support(cx, cy, cz, raft_top_z=0.0))
 
-# Model-resting supports (no base pad — column starts from model surface)
+# Model-resting supports — column starts directly from model surface.
+# No separate base pad: BASE_PAD_RADIUS (1.5mm) is wider than the wall
+# thickness (~1.14mm after tilt), so a pad would protrude through the
+# exterior surface.  The column (COLUMN_RADIUS=0.7mm, 1.4mm dia) provides
+# adequate adhesion area on the model surface.
 for (cx, cy, cz, base_z) in model_contacts:
-    # Small adhesion pad on model surface (thinner than raft pad)
-    pad = Part.makeCylinder(BASE_PAD_RADIUS, 0.4,
-                            Vector(cx, cy, base_z), Vector(0, 0, 1))
-    all_support_shapes.append(pad)
-    col_bot = base_z + 0.4
     col_top = cz - TIP_HEIGHT
-    if col_top > col_bot:
-        col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_bot,
-                                Vector(cx, cy, col_bot), Vector(0, 0, 1))
+    if col_top > base_z:
+        col = Part.makeCylinder(COLUMN_RADIUS, col_top - base_z,
+                                Vector(cx, cy, base_z), Vector(0, 0, 1))
         all_support_shapes.append(col)
     else:
-        col_top = col_bot
+        col_top = base_z
     cone = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, TIP_HEIGHT,
                          Vector(cx, cy, col_top), Vector(0, 0, 1))
     all_support_shapes.append(cone)

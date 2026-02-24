@@ -117,6 +117,14 @@ EXTERIOR_EDGE_CLEAR = COLUMN_RADIUS + 1.5   # 2.2mm from exterior edge (clears 1
 # overhanging clapboard.  Threshold must exceed 1.81mm.
 NARROW_FACE_THRESH  = 2.0   # mm
 
+# Bias for narrow face contact placement: distance from exterior edge.
+# Must exceed COLUMN_RADIUS so column doesn't reach exterior surface,
+# AND exceed (bias - TIP_RADIUS) so cone tip is well inside.
+# With 1.2mm: column clears exterior by 0.5mm, cone tip by 0.8mm.
+# On a 1.14mm face, contact lands 0.06mm past interior edge (within
+# the 0.5mm bbox tolerance).  On a 0.99mm face, 0.21mm past interior.
+NARROW_EXT_BIAS = COLUMN_RADIUS + TIP_RADIUS + 0.1  # 1.2mm
+
 raw_contacts = []
 
 
@@ -165,13 +173,10 @@ def _collect_contacts(face, raw_contacts, model_center_y, model_center_x):
         ext_at_xmax = (com.x > model_center_x)
         if ext_at_xmax:
             # Exterior at XMax → push contact toward XMin (interior)
-            # Column extends from (contact_x - R) to (contact_x + R)
-            # Prevent exterior overshoot: contact_x + R <= fbb.XMax
-            cx = fbb.XMax - COLUMN_RADIUS
+            cx = fbb.XMax - NARROW_EXT_BIAS
         else:
             # Exterior at XMin → push contact toward XMax (interior)
-            # Prevent exterior overshoot: contact_x - R >= fbb.XMin
-            cx = fbb.XMin + COLUMN_RADIUS
+            cx = fbb.XMin + NARROW_EXT_BIAS
         xs = [cx]
 
         # Y positions: face is long in Y, use grid spacing with Y clearance
@@ -207,10 +212,10 @@ def _collect_contacts(face, raw_contacts, model_center_y, model_center_x):
             # Bias contact Y toward interior so column only overshoots interior.
             if ext_at_ymax:
                 # Exterior at YMax → push contact toward YMin (interior)
-                cy = fbb.YMax - COLUMN_RADIUS
+                cy = fbb.YMax - NARROW_EXT_BIAS
             else:
                 # Exterior at YMin → push contact toward YMax (interior)
-                cy = fbb.YMin + COLUMN_RADIUS
+                cy = fbb.YMin + NARROW_EXT_BIAS
             ys = [cy]
         else:
             # Wide face: use asymmetric clearance in Y.
@@ -405,9 +410,90 @@ for (cx, cy, cz, base_z) in model_contacts:
                          Vector(cx, cy, col_top), Vector(0, 0, 1))
     all_support_shapes.append(cone)
 
-supports = Part.Compound(all_support_shapes)
 print(f"Built {len(raft_contacts) + len(model_contacts)} supports "
       f"({len(all_support_shapes)} shapes)")
+
+# ---------------------------------------------------------------------------
+# Clip supports against building panels + exterior zones
+# ---------------------------------------------------------------------------
+# Support columns (1.4mm dia) on thin walls (~1.14mm) extend slightly
+# beyond the panel solid on the exterior side.  sup.cut(panel) only removes
+# the part INSIDE the wall — the exterior protrusion is OUTSIDE the panel
+# solid and survives.
+#
+# Fix: for each panel, create an "exterior slab" — a box covering the region
+# just beyond the panel's exterior surface (3mm deep, spanning the panel's
+# YZ or XZ extent).  For each support that intersects a panel, do two
+# sequential cuts: first panel (removes wall intersection), then slab
+# (removes exterior protrusion).  Sequential individual cuts are more
+# reliable than compound/fuse boolean operations.
+
+model_cx = (model_bb.XMin + model_bb.XMax) / 2
+model_cy = (model_bb.YMin + model_bb.YMax) / 2
+EXT_SLAB_DEPTH = 3.0    # mm outward from panel exterior surface
+EXT_SLAB_MARGIN = 1.0   # mm extra coverage in the non-clip directions
+
+_panel_ext_slabs = []
+_panel_slab_bbs = []
+for j, panel in enumerate(_panels):
+    pcom = panel.CenterOfMass
+    pbb = _panel_bbs[j]
+    dx = pcom.x - model_cx
+    dy = pcom.y - model_cy
+    d = EXT_SLAB_DEPTH
+    m = EXT_SLAB_MARGIN
+
+    if abs(dx) > abs(dy):
+        if dx > 0:
+            slab = Part.makeBox(d, pbb.YLength + 2*m, pbb.ZLength + 2*m,
+                                Vector(pbb.XMax - 0.1, pbb.YMin - m, pbb.ZMin - m))
+        else:
+            slab = Part.makeBox(d, pbb.YLength + 2*m, pbb.ZLength + 2*m,
+                                Vector(pbb.XMin - d + 0.1, pbb.YMin - m, pbb.ZMin - m))
+    else:
+        if dy > 0:
+            slab = Part.makeBox(pbb.XLength + 2*m, d, pbb.ZLength + 2*m,
+                                Vector(pbb.XMin - m, pbb.YMax - 0.1, pbb.ZMin - m))
+        else:
+            slab = Part.makeBox(pbb.XLength + 2*m, d, pbb.ZLength + 2*m,
+                                Vector(pbb.XMin - m, pbb.YMin - d + 0.1, pbb.ZMin - m))
+
+    _panel_ext_slabs.append(slab)
+    _panel_slab_bbs.append(slab.BoundBox)
+
+# For each support, sequentially cut each overlapping panel + its slab.
+clipped_shapes = []
+clip_count = 0
+for sup in all_support_shapes:
+    result = sup
+    clipped = False
+    for j, pbb in enumerate(_panel_bbs):
+        rbb = result.BoundBox
+        # Quick bbox reject against panel
+        if (rbb.XMax < pbb.XMin - 0.5 or rbb.XMin > pbb.XMax + 0.5 or
+            rbb.YMax < pbb.YMin - 0.5 or rbb.YMin > pbb.YMax + 0.5 or
+            rbb.ZMax < pbb.ZMin - 0.5 or rbb.ZMin > pbb.ZMax + 0.5):
+            continue
+        try:
+            inter = _panels[j].common(result)
+            if inter.Volume < 0.001:
+                continue
+            # Cut panel (removes wall intersection)
+            r2 = result.cut(_panels[j])
+            # Cut exterior slab (removes exterior protrusion)
+            r3 = r2.cut(_panel_ext_slabs[j])
+            if r3.Volume > 0.01:
+                result = r3
+                clipped = True
+        except Exception:
+            pass
+    if clipped:
+        clip_count += 1
+    clipped_shapes.append(result)
+
+print(f"Clipped {clip_count} support shapes (panel + exterior slab)")
+
+supports = Part.Compound(clipped_shapes)
 
 # Size raft from model footprint + raft-based support pads.
 # Model-resting supports don't touch the raft, so excluded.

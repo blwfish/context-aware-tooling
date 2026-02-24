@@ -77,35 +77,65 @@ print(f"Footprint: {model_bb.XLength:.1f} x {model_bb.YLength:.1f} mm, "
 # Support contact generation
 # ---------------------------------------------------------------------------
 #
-# THRESH = -0.5: main pass catches wall-base faces (n.z ≈ -0.95 after tilts)
-#   but NOT display/clapboard face (n.z ≈ -0.31) or vertical wall faces.
+# Face selection uses TWO filters to isolate wall-base faces:
 #
-# EDGE_CLEAR: minimum Y distance between support column axis and face edge.
-#   Prevents column (radius COLUMN_RADIUS=0.7mm from support_utils) from
-#   overlapping adjacent wall faces. With 0.3mm air gap: 0.7 + 0.3 = 1.0mm.
-#   For faces shallower than 2×EDGE_CLEAR (~1.14mm wall bases after tilt),
-#   the column axis is clamped to face center — there is no fully safe position,
-#   but centering minimizes intrusion on both sides.
+# 1. THRESH = -0.5: normal Z threshold catches strongly downward-facing faces
+#    (n.z ≈ -0.95 after tilts).  This includes wall bases AND clapboard plank
+#    step faces (both were originally horizontal).
 #
-# TOP_THRESH = -0.20: second pass catches shallower downward-facing faces in
-#   the upper portion of the model (interior wall faces near wall tops, which
-#   have n.z ≈ -0.31 after 18° tilt — too shallow for THRESH=-0.5 but still
-#   need support to prevent upper-edge warping during peel).
+# 2. MIN_OVERHANG_DEPTH = 0.6mm: minimum shortest-edge length.  Wall bases
+#    have min_edge ≈ 0.80mm (1.2mm wall after boolean thinning, projected
+#    through rotations).  Clapboard plank steps have min_edge ≈ 0.40mm.
+#    Threshold at 0.6mm cleanly separates them (0.2mm margin each side)
+#    without relying on position (which fails for a 4-walled building
+#    where exterior faces exist at all Y positions, not just YMax).
 #
-THRESH      = -0.5
-GRID        = 8.0    # mm — cluster spacing
-EDGE_CLEAR  = COLUMN_RADIUS + 0.3   # 1.0mm clearance from face edge to column axis
+# EDGE_CLEAR: minimum distance between support column axis and face edge.
+#   Prevents column (radius COLUMN_RADIUS=0.7mm) from overlapping adjacent
+#   wall faces.  INTERIOR_EDGE_CLEAR is tight (column just fits inside the
+#   face).  EXTERIOR_EDGE_CLEAR is generous (keeps column well away from
+#   the display surface).
+#
+#   For 1.2mm walls after 18° tilt, the wall thickness projects to ~1.14mm
+#   in Y (side walls) or ~1.2mm in X (front/back walls).  A column at
+#   EDGE_CLEAR=1.0mm from the exterior edge would penetrate the exterior
+#   surface.  Asymmetric clearance fixes this: large on exterior side,
+#   small on interior side.
+#
+THRESH              = -0.5
+MIN_OVERHANG_DEPTH  = 0.6    # mm — shortest edge; rejects clapboard steps (0.40mm), keeps wall bases (0.80mm)
+GRID                = 8.0    # mm — cluster spacing
+INTERIOR_EDGE_CLEAR = COLUMN_RADIUS + 0.3   # 1.0mm from interior edge
+EXTERIOR_EDGE_CLEAR = COLUMN_RADIUS + 1.5   # 2.2mm from exterior edge (clears 1.2mm wall)
+
+# Narrow face threshold: faces thinner than this in one axis get special
+# handling — contact biased toward interior so column only overshoots
+# on the invisible interior side.
+# After 4-axis tilt, left/right wall bases have y_span ≈ 1.81mm.
+# The clapboard of the adjacent panel overhangs the face edge, so even
+# though the column (1.4mm dia) nominally fits, it intersects the
+# overhanging clapboard.  Threshold must exceed 1.81mm.
+NARROW_FACE_THRESH  = 2.0   # mm
 
 raw_contacts = []
 
 
-def _collect_contacts(face, raw_contacts):
+def _collect_contacts(face, raw_contacts, model_center_y, model_center_x):
     """
     Compute and append contact points for one downward-facing face.
 
-    Y positions are clamped by EDGE_CLEAR so the support column (radius
-    COLUMN_RADIUS) doesn't overlap the face's adjacent wall surfaces.
-    Points outside the face bounding box are discarded.
+    Filters out clapboard/detail faces using MIN_OVERHANG_DEPTH (shortest
+    edge).  Contact positions use asymmetric clearance: generous on the
+    exterior side (to avoid penetrating display surfaces), tight on the
+    interior side.
+
+    Handles two face orientations:
+    - Narrow-in-Y (left/right walls): thin dimension is Y, long axis is X.
+      Asymmetric clearance in Y.
+    - Narrow-in-X (front/back walls): thin dimension is X, long axis is Y.
+      Contact X biased toward interior so column only overshoots on
+      interior side.  Column radius (0.7mm) > half face width (0.5mm),
+      so some interior overshoot is unavoidable but invisible.
     """
     if face.Area < 0.5:
         return
@@ -116,36 +146,102 @@ def _collect_contacts(face, raw_contacts):
     if abs(n.z) < 0.05:       # skip near-vertical faces
         return
 
+    # Reject clapboard plank steps and other thin detail faces.
+    # Wall bases have min_edge ≈ 0.80mm (1.2mm walls); clapboard steps ≈ 0.40mm.
+    min_edge = min(e.Length for e in face.Edges) if face.Edges else 0
+    if min_edge < MIN_OVERHANG_DEPTH:
+        return
+
     com = face.CenterOfMass
     fbb = face.BoundBox
 
-    # X positions
-    if fbb.XLength < GRID:
-        xs = [com.x]
-    else:
-        xs = [fbb.XMin + GRID/2 + i*GRID
-              for i in range(int(fbb.XLength / GRID) + 1)]
+    # Detect face orientation: is the narrow axis X or Y?
+    narrow_in_x = fbb.XLength < NARROW_FACE_THRESH and fbb.YLength > NARROW_FACE_THRESH
 
-    # Y positions with EDGE_CLEAR clamping.
-    # safe_y_min/max is the zone where the column fits without overlapping
-    # the face's YMin or YMax adjacent wall surfaces.
-    safe_y_min = fbb.YMin + EDGE_CLEAR
-    safe_y_max = fbb.YMax - EDGE_CLEAR
+    if narrow_in_x:
+        # --- NARROW-IN-X face (front/back wall base) ---
+        # Thin dimension is X (~0.99mm).  Column (1.4mm dia) can't fit.
+        # Bias contact X toward interior so column only overshoots interior side.
+        ext_at_xmax = (com.x > model_center_x)
+        if ext_at_xmax:
+            # Exterior at XMax → push contact toward XMin (interior)
+            # Column extends from (contact_x - R) to (contact_x + R)
+            # Prevent exterior overshoot: contact_x + R <= fbb.XMax
+            cx = fbb.XMax - COLUMN_RADIUS
+        else:
+            # Exterior at XMin → push contact toward XMax (interior)
+            # Prevent exterior overshoot: contact_x - R >= fbb.XMin
+            cx = fbb.XMin + COLUMN_RADIUS
+        xs = [cx]
 
-    if safe_y_min > safe_y_max:
-        # Face too shallow for full clearance on both sides.
-        # Best we can do: center the column; it will intrude slightly on both.
-        ys = [com.y]
-    elif fbb.YLength < GRID:
-        # Face narrower than grid: one contact, clamped to safe zone.
-        ys = [max(safe_y_min, min(safe_y_max, com.y))]
+        # Y positions: face is long in Y, use grid spacing with Y clearance
+        # For front/back walls, determine exterior Y side for clearance.
+        ext_at_ymax = (com.y > model_center_y)
+        if ext_at_ymax:
+            safe_y_min = fbb.YMin + INTERIOR_EDGE_CLEAR
+            safe_y_max = fbb.YMax - EXTERIOR_EDGE_CLEAR
+        else:
+            safe_y_min = fbb.YMin + EXTERIOR_EDGE_CLEAR
+            safe_y_max = fbb.YMax - INTERIOR_EDGE_CLEAR
+
+        if safe_y_min > safe_y_max:
+            if ext_at_ymax:
+                ys = [fbb.YMin + INTERIOR_EDGE_CLEAR]
+            else:
+                ys = [fbb.YMax - INTERIOR_EDGE_CLEAR]
+        elif fbb.YLength < GRID:
+            ys = [max(safe_y_min, min(safe_y_max, com.y))]
+        else:
+            raw_ys = [fbb.YMin + GRID/2 + i*GRID
+                      for i in range(int(fbb.YLength / GRID) + 1)]
+            ys = list(dict.fromkeys(
+                max(safe_y_min, min(safe_y_max, y)) for y in raw_ys
+            ))
     else:
-        raw_ys = [fbb.YMin + GRID/2 + i*GRID
-                  for i in range(int(fbb.YLength / GRID) + 1)]
-        # Clamp each grid position to safe zone and deduplicate.
-        ys = list(dict.fromkeys(
-            max(safe_y_min, min(safe_y_max, y)) for y in raw_ys
-        ))
+        # --- NARROW-IN-Y face (left/right wall base) or wide face ---
+        narrow_in_y = fbb.YLength < NARROW_FACE_THRESH and fbb.XLength > NARROW_FACE_THRESH
+        ext_at_ymax = (com.y > model_center_y)
+
+        if narrow_in_y:
+            # Thin dimension is Y (~1.40mm).  Column (1.4mm dia) barely fits.
+            # Bias contact Y toward interior so column only overshoots interior.
+            if ext_at_ymax:
+                # Exterior at YMax → push contact toward YMin (interior)
+                cy = fbb.YMax - COLUMN_RADIUS
+            else:
+                # Exterior at YMin → push contact toward YMax (interior)
+                cy = fbb.YMin + COLUMN_RADIUS
+            ys = [cy]
+        else:
+            # Wide face: use asymmetric clearance in Y.
+            if ext_at_ymax:
+                safe_y_min = fbb.YMin + INTERIOR_EDGE_CLEAR
+                safe_y_max = fbb.YMax - EXTERIOR_EDGE_CLEAR
+            else:
+                safe_y_min = fbb.YMin + EXTERIOR_EDGE_CLEAR
+                safe_y_max = fbb.YMax - INTERIOR_EDGE_CLEAR
+
+            # Y positions
+            if safe_y_min > safe_y_max:
+                if ext_at_ymax:
+                    ys = [fbb.YMin + INTERIOR_EDGE_CLEAR]
+                else:
+                    ys = [fbb.YMax - INTERIOR_EDGE_CLEAR]
+            elif fbb.YLength < GRID:
+                ys = [max(safe_y_min, min(safe_y_max, com.y))]
+            else:
+                raw_ys = [fbb.YMin + GRID/2 + i*GRID
+                          for i in range(int(fbb.YLength / GRID) + 1)]
+                ys = list(dict.fromkeys(
+                    max(safe_y_min, min(safe_y_max, y)) for y in raw_ys
+                ))
+
+        # X positions
+        if fbb.XLength < GRID:
+            xs = [com.x]
+        else:
+            xs = [fbb.XMin + GRID/2 + i*GRID
+                  for i in range(int(fbb.XLength / GRID) + 1)]
 
     for x in xs:
         for y in ys:
@@ -159,14 +255,11 @@ def _collect_contacts(face, raw_contacts):
 
 
 # -- Main pass: wall-base faces (strongly downward-facing, n.z < -0.5) -------
-# After 18° X-tilt, horizontal faces have n.z ≈ -0.95 and n.y ≈ +0.31.
-# This includes both the correct wall-base faces AND clapboard plank step
-# faces on the display side.  The display-face Y filter below removes the
-# clapboard step contacts after clustering.
-#
-# NOTE: a second "top-zone" pass (n.z in (-0.5, -0.2)) was tested but
-# proved to catch ONLY the clapboard exterior faces (n.y=-0.95, area up
-# to 810mm²) — i.e., every face in that range was wrong.  It was removed.
+# After 18° X-tilt, both wall bases and clapboard steps have n.z ≈ -0.95.
+# The MIN_OVERHANG_DEPTH filter inside _collect_contacts separates them:
+# wall bases have min_edge ≈ 0.80mm, clapboard steps ≈ 0.3–0.4mm.
+center_y = (model_bb.YMin + model_bb.YMax) / 2.0
+center_x = (model_bb.XMin + model_bb.XMax) / 2.0
 for face in s5.Faces:
     try:
         n = face.normalAt(0.5, 0.5)
@@ -174,7 +267,7 @@ for face in s5.Faces:
         continue
     if n.z > THRESH:
         continue
-    _collect_contacts(face, raw_contacts)
+    _collect_contacts(face, raw_contacts, center_y, center_x)
 
 print(f"Raw contacts: {len(raw_contacts)}")
 
@@ -195,32 +288,131 @@ contacts = [
     for (cx, cy, cz) in cells.values()
 ]
 
-# Filter contacts too close to the display face.
+print(f"Clustered contacts: {len(contacts)}")
+
+# ---------------------------------------------------------------------------
+# Collision check: find per-contact base_z (raft or model-resting)
+# ---------------------------------------------------------------------------
+# For a tilted 4-walled building, support columns for far-wall contacts
+# are very tall and pass through near-wall panels.  For each contact,
+# check if the vertical column from z=0 to z=cz intersects the model.
+# If blocked, start the support from the TOP of the intersection
+# ("support-on-model") instead of from the raft.
 #
-# The display/clapboard face is at model_bb.YMax (≈118mm).  The interior/
-# plate side is at model_bb.YMin (≈0mm).  Contacts at high Y are either ON
-# the clapboard surface or inside the 1.2mm clapboard wall, where a support
-# column (r=0.7mm) would merge with or poke through the detail surface.
-#
-# Diagnostic confirmed: clapboard plank step faces in the main pass have
-# com.y up to 117.5mm (just 0.7mm from model_bb.YMax=118.2mm).  A 3.0mm
-# margin gives clearance from the clapboard wall interior face (~1.2mm
-# thick) plus the column radius (0.7mm) plus 1.1mm air gap.
-DISPLAY_Y_MAX_CLEAR = 3.0   # mm from model YMax (display/clapboard face)
-n_before = len(contacts)
-contacts = [(cx, cy, cz) for cx, cy, cz in contacts
-            if cy <= model_bb.YMax - DISPLAY_Y_MAX_CLEAR]
-print(f"Clustered contacts: {len(contacts)} "
-      f"({n_before - len(contacts)} dropped near display face)")
+# Uses distToShape for fast pre-screening, then boolean intersection
+# only for blocked contacts to find exact ZMax.
+
+MODEL_REST_GAP = 0.3   # mm gap between model surface and support base
+
+# Pre-compute per-panel bounding boxes for fast XY overlap tests.
+# Only panels whose XY footprint overlaps the column need boolean checks.
+_panels = list(s5.Solids)
+_panel_bbs = [p.BoundBox for p in _panels]
+
+def _find_support_base(cx, cy, cz, col_radius):
+    """Return base_z for a support column. 0.0 = raft, >0 = model surface."""
+    # Check each panel whose bbox overlaps the column in XY and Z
+    max_z_hit = -1.0
+    margin = col_radius + 0.5
+    for i, pbb in enumerate(_panel_bbs):
+        # Fast bbox reject: no XY overlap
+        if (cx + margin < pbb.XMin or cx - margin > pbb.XMax or
+            cy + margin < pbb.YMin or cy - margin > pbb.YMax):
+            continue
+        # No Z overlap in the check region (below cz - 3mm)
+        if pbb.ZMin > cz - 3.0 or pbb.ZMax < 0.1:
+            continue
+        # This panel's bbox overlaps — do precise distance check
+        line_z1 = min(cz - 3.0, pbb.ZMax)
+        line_z0 = max(0.1, pbb.ZMin)
+        if line_z1 <= line_z0 + 0.1:
+            continue
+        line = Part.makeLine(Vector(cx, cy, line_z0),
+                             Vector(cx, cy, line_z1))
+        try:
+            dist, _pts, _info = _panels[i].distToShape(line)
+        except Exception:
+            continue
+        if dist > col_radius + 0.1:
+            continue
+        # Blocked by this panel. Find exact ZMax via boolean.
+        # Only check the region BELOW the contact (cz - 3mm).
+        # Intersections near cz are the contact's OWN panel — the column
+        # always intersects its own wall near the cone tip transition.
+        # We only care about CROSS-PANEL collisions lower down.
+        col_z0 = max(0.0, pbb.ZMin - 1.0)
+        col_z1 = min(cz - 3.0, pbb.ZMax + 1.0)
+        if col_z1 <= col_z0 + 0.5:
+            continue  # panel is entirely near the contact, skip
+        col = Part.makeCylinder(col_radius, col_z1 - col_z0,
+                                Vector(cx, cy, col_z0), Vector(0, 0, 1))
+        try:
+            intersection = _panels[i].common(col)
+            if intersection.Volume > 0.001:
+                max_z_hit = max(max_z_hit, intersection.BoundBox.ZMax)
+        except Exception:
+            continue
+
+    if max_z_hit < 0:
+        return 0.0  # clear path to raft
+    base_z = max_z_hit + MODEL_REST_GAP
+    # Sanity: base must be well below contact
+    if base_z > cz - TIP_HEIGHT - 1.0:
+        return -1.0  # can't fit a support, skip this contact
+    return base_z
+
+
+print(f"Checking {len(contacts)} support paths for model collisions "
+      f"({len(_panels)} panels)...")
+raft_contacts = []       # (cx, cy, cz) — normal raft-based supports
+model_contacts = []      # (cx, cy, cz, base_z) — model-resting supports
+skipped = 0
+
+for (cx, cy, cz) in contacts:
+    base_z = _find_support_base(cx, cy, cz, COLUMN_RADIUS)
+    if base_z < 0:
+        skipped += 1
+    elif base_z < 0.1:
+        raft_contacts.append((cx, cy, cz))
+    else:
+        model_contacts.append((cx, cy, cz, base_z))
+
+print(f"  Raft-based: {len(raft_contacts)}, model-resting: {len(model_contacts)}, "
+      f"skipped: {skipped}")
 
 # ---------------------------------------------------------------------------
 # Build supports and raft
 # ---------------------------------------------------------------------------
-supports = build_supports(contacts, raft_top_z=0.0)
+# Raft-based supports (normal)
+all_support_shapes = []
+for (cx, cy, cz) in raft_contacts:
+    all_support_shapes.extend(build_tapered_support(cx, cy, cz, raft_top_z=0.0))
 
-# Size raft from model footprint only (not contact pads) so raft_Y = model_Y + 4mm.
-# All support base pads (radius 1.5mm) stay within the 2mm raft margin.
-raft = build_raft(s5, contact_points=None)
+# Model-resting supports (no base pad — column starts from model surface)
+for (cx, cy, cz, base_z) in model_contacts:
+    # Small adhesion pad on model surface (thinner than raft pad)
+    pad = Part.makeCylinder(BASE_PAD_RADIUS, 0.4,
+                            Vector(cx, cy, base_z), Vector(0, 0, 1))
+    all_support_shapes.append(pad)
+    col_bot = base_z + 0.4
+    col_top = cz - TIP_HEIGHT
+    if col_top > col_bot:
+        col = Part.makeCylinder(COLUMN_RADIUS, col_top - col_bot,
+                                Vector(cx, cy, col_bot), Vector(0, 0, 1))
+        all_support_shapes.append(col)
+    else:
+        col_top = col_bot
+    cone = Part.makeCone(COLUMN_RADIUS, TIP_RADIUS, TIP_HEIGHT,
+                         Vector(cx, cy, col_top), Vector(0, 0, 1))
+    all_support_shapes.append(cone)
+
+supports = Part.Compound(all_support_shapes)
+print(f"Built {len(raft_contacts) + len(model_contacts)} supports "
+      f"({len(all_support_shapes)} shapes)")
+
+# Size raft from model footprint + raft-based support pads.
+# Model-resting supports don't touch the raft, so excluded.
+raft = build_raft(s5, contact_points=raft_contacts if raft_contacts else None)
 raft_bb = raft.BoundBox
 print(f"Raft: {raft_bb.XLength:.1f} x {raft_bb.YLength:.1f} mm "
       f"(M7 Pro limit: 218 x 123 mm)")

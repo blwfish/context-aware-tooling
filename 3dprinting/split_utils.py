@@ -520,7 +520,7 @@ def _classify_split_face_edges(shape, split_face):
     return results
 
 
-def _tab_positions_along_edge(edge, plane_normal, interior_dir,
+def _tab_positions_along_edge(edge, plane_normal, wall_dir,
                                spacing=TAB_SPACING, margin=TAB_EDGE_MARGIN,
                                count=None):
     """
@@ -532,8 +532,8 @@ def _tab_positions_along_edge(edge, plane_normal, interior_dir,
         The interior edge to distribute tabs along.
     plane_normal : Vector
         Normal of the split plane (tab protrusion direction).
-    interior_dir : Vector
-        Direction from the edge toward the model interior (for tab offset).
+    wall_dir : Vector
+        Direction from the interior edge into the wall (toward exterior).
     spacing : float
         Target spacing between tabs.
     margin : float
@@ -544,7 +544,7 @@ def _tab_positions_along_edge(edge, plane_normal, interior_dir,
     Returns
     -------
     list of (Vector, Vector, Vector)
-        Each entry is (center, plane_normal, interior_dir) — the tab
+        Each entry is (center, plane_normal, wall_dir) — the tab
         center on the split face, the protrusion direction, and the
         inward direction for tab height.
     """
@@ -572,12 +572,12 @@ def _tab_positions_along_edge(edge, plane_normal, interior_dir,
     positions = []
     for param in params:
         pt = edge.valueAt(param)
-        positions.append((pt, Vector(plane_normal), Vector(interior_dir)))
+        positions.append((pt, Vector(plane_normal), Vector(wall_dir)))
 
     return positions
 
 
-def _make_tab_box(center, plane_normal, interior_dir,
+def _make_tab_box(center, plane_normal, wall_dir,
                   width, height, d_back, d_front):
     """
     Build a solid box for a tab or slot, straddling the split plane.
@@ -591,7 +591,7 @@ def _make_tab_box(center, plane_normal, interior_dir,
         Center of the tab on the split face, at the interior wall edge.
     plane_normal : Vector
         Direction from negative half toward positive half.
-    interior_dir : Vector
+    wall_dir : Vector
         Direction toward the model interior.
     width : float
         Extent along the split edge.
@@ -608,14 +608,14 @@ def _make_tab_box(center, plane_normal, interior_dir,
     """
     n = Vector(plane_normal)
     n.normalize()
-    inward = Vector(interior_dir)
-    inward.normalize()
-    along_edge = n.cross(inward)
+    into_wall = Vector(wall_dir)
+    into_wall.normalize()
+    along_edge = n.cross(into_wall)
     along_edge.normalize()
 
     hw = width / 2
     corners = [
-        center + along_edge * s * hw + inward * h + n * d
+        center + along_edge * s * hw + into_wall * h + n * d
         for s in (-1, 1)
         for h in (0, height)
         for d in (-d_back, d_front)
@@ -641,14 +641,15 @@ def _make_tab_box(center, plane_normal, interior_dir,
     return Part.makeSolid(shell)
 
 
-def make_tab(center, plane_normal, interior_dir,
+def make_tab(center, plane_normal, wall_dir,
              width=TAB_WIDTH, depth=TAB_DEPTH, height=TAB_HEIGHT):
     """
     Make a registration tab that straddles the split plane.
 
-    The tab is a rectangular shelf on the interior side of the wall,
-    extending backward (base bonded to source wall) and forward
-    (tongue that slots into mating piece).
+    The tab wraps the interior corner of the wall: it extends into
+    the wall material (for structural bond and slot engagement) and
+    protrudes from the split face in both directions (base on source
+    piece, tongue into mating piece).
 
     Parameters
     ----------
@@ -656,35 +657,35 @@ def make_tab(center, plane_normal, interior_dir,
         Center of the tab on the split face, at the interior wall edge.
     plane_normal : Vector
         Direction from negative half toward positive half.
-    interior_dir : Vector
-        Direction toward the model interior.
+    wall_dir : Vector
+        Direction from the interior edge INTO the wall (toward exterior).
     width : float
         Tab extent along the split edge.
     depth : float
         Tab protrusion from the split face in each direction.
     height : float
-        Tab extent inward from the wall edge.
+        Tab extent into the wall from the interior edge.
 
     Returns
     -------
     Part.Shape
     """
-    return _make_tab_box(center, plane_normal, interior_dir,
+    return _make_tab_box(center, plane_normal, wall_dir,
                          width, height, d_back=depth, d_front=depth)
 
 
-def make_tab_slot(center, plane_normal, interior_dir,
+def make_tab_slot(center, plane_normal, wall_dir,
                   width=TAB_WIDTH, depth=TAB_DEPTH, height=TAB_HEIGHT,
                   clearance=TAB_CLEARANCE):
     """
     Make a slot matching a registration tab, with clearance.
 
-    The slot extends from the split face into the mating piece only
-    (the forward half), oversized by clearance for fit.
+    The slot extends from the split face into the mating piece,
+    cutting into the wall material so the tab tongue can seat.
 
     Parameters
     ----------
-    center, plane_normal, interior_dir, width, depth, height :
+    center, plane_normal, wall_dir, width, depth, height :
         Same as make_tab.
     clearance : float
         Oversize on each side for fit.
@@ -694,7 +695,7 @@ def make_tab_slot(center, plane_normal, interior_dir,
     Part.Shape
         Solid to be subtracted (boolean cut) from the mating piece.
     """
-    return _make_tab_box(center, plane_normal, interior_dir,
+    return _make_tab_box(center, plane_normal, wall_dir,
                          width=width + 2 * clearance,
                          height=height + clearance,
                          d_back=clearance,  # slight cut past split face
@@ -766,8 +767,10 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         mid = edge.valueAt(
             edge.FirstParameter + (edge.LastParameter - edge.FirstParameter) / 2
         )
-        # Interior direction: from the edge toward BB center,
-        # projected onto the split plane
+        # Wall direction: from the interior edge INTO the wall
+        # (toward the exterior).  This is AWAY from the BB center,
+        # so the tab wraps the interior corner — partly embedded
+        # in the wall, partly protruding into the hollow.
         to_center = bb_center - mid
         # Remove component along plane normal
         to_center = to_center - n * to_center.dot(n)
@@ -777,7 +780,7 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         if to_center.Length < 1e-6:
             continue
         to_center.normalize()
-        interior_dir = to_center
+        wall_dir = to_center * -1  # flip: into wall, not into hollow
 
         # Distribute tabs proportionally by edge length
         if tab_count is not None:
@@ -785,7 +788,7 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         else:
             edge_count = None
 
-        tabs = _tab_positions_along_edge(edge, n, interior_dir, count=edge_count)
+        tabs = _tab_positions_along_edge(edge, n, wall_dir, count=edge_count)
         all_tab_params.extend(tabs)
 
     if not all_tab_params:
@@ -794,9 +797,9 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
 
     tab_shapes = []
     slot_shapes = []
-    for center, pn, indir in all_tab_params:
-        tab_shapes.append(make_tab(center, pn, indir))
-        slot_shapes.append(make_tab_slot(center, pn, indir))
+    for center, pn, wdir in all_tab_params:
+        tab_shapes.append(make_tab(center, pn, wdir))
+        slot_shapes.append(make_tab_slot(center, pn, wdir))
 
     # Fuse tabs onto negative half
     tab_compound = Part.Compound(tab_shapes)

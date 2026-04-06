@@ -800,42 +800,39 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
 
     all_tab_params = []  # list of (center, plane_normal, wall_dir, tab_height)
     for edge, _ in interior_edges:
-        mid = edge.valueAt(
-            edge.FirstParameter + (edge.LastParameter - edge.FirstParameter) / 2
-        )
-        # Wall direction: from the interior edge INTO the wall
-        # (toward the exterior).  This is AWAY from the BB center,
-        # so the tab wraps the interior corner — partly embedded
-        # in the wall, partly protruding into the hollow.
-        to_center = bb_center - mid
-        # Remove component along plane normal
-        to_center = to_center - n * to_center.dot(n)
-        # Remove component along the edge direction
-        edge_dir = edge.tangentAt(edge.FirstParameter)
-        to_center = to_center - edge_dir * to_center.dot(edge_dir)
-        if to_center.Length < 1e-6:
-            continue
-        to_center.normalize()
-        wall_dir = to_center * -1  # flip: into wall, not into hollow
-
-        # Measure wall thickness at edge midpoint by probing along wall_dir
-        wall_thickness = _measure_wall_thickness(neg_half, mid, wall_dir)
-        # Clamp tab height to at most half the wall thickness
-        # so the slot never breaks through to the exterior
-        tab_height = min(TAB_HEIGHT, wall_thickness / 2.0)
-        if tab_height < 0.1:
-            logger.warning(f"Wall too thin ({wall_thickness:.2f}mm) for tabs")
-            continue
-
-        # Distribute tabs proportionally by edge length
+        # Distribute tab positions along this edge
         if tab_count is not None:
             edge_count = max(1, round(tab_count * edge.Length / total_interior_length))
         else:
             edge_count = None
 
-        tabs = _tab_positions_along_edge(edge, n, wall_dir, count=edge_count)
-        for center, pn, wdir in tabs:
-            all_tab_params.append((center, pn, wdir, tab_height))
+        # Get positions only (wall_dir placeholder — will recompute per-position)
+        tabs = _tab_positions_along_edge(edge, n, Vector(0, 0, 0), count=edge_count)
+
+        for center, pn, _ in tabs:
+            # Compute wall_dir at THIS tab position, not the edge midpoint.
+            # Critical for curved edges (circles, arcs) where the radial
+            # direction varies along the edge.
+            to_center = bb_center - center
+            # Remove component along plane normal
+            to_center = to_center - n * to_center.dot(n)
+            # Remove component along edge tangent at this position
+            param = edge.Curve.parameter(center)
+            edge_tangent = edge.tangentAt(param)
+            to_center = to_center - edge_tangent * to_center.dot(edge_tangent)
+            if to_center.Length < 1e-6:
+                continue
+            to_center.normalize()
+            wall_dir = to_center * -1  # flip: into wall, not into hollow
+
+            # Measure wall thickness at this position
+            wall_thickness = _measure_wall_thickness(neg_half, center, wall_dir)
+            tab_height = min(TAB_HEIGHT, wall_thickness / 2.0)
+            if tab_height < 0.1:
+                logger.warning(f"Wall too thin ({wall_thickness:.2f}mm) for tabs")
+                continue
+
+            all_tab_params.append((center, pn, wall_dir, tab_height))
 
     if not all_tab_params:
         logger.warning("No tab positions found on interior edges")

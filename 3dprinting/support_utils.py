@@ -8,7 +8,8 @@ Implements the pipeline described in context-aware-supports.md.
 Usage (from FreeCAD MCP execute_python or generate_building_print.py):
     from support_utils import (
         Contact, build_tapered_support, build_supports, build_raft,
-        check_build_fit, classify_faces, tilt_for_printing,
+        check_build_fit, create_working_copy, record_pipeline_step,
+        classify_faces, tilt_for_printing,
         tilted_wall_outward_normal, generate_all_overhang_supports,
     )
 
@@ -105,6 +106,118 @@ BASE_PAD_HEIGHT = 0.8          # mm (taller base for shear resistance)
 
 BOTTOM_SUPPORT_SPACING = 2.0   # mm along longest axis
 BOTTOM_SUPPORT_MIN_DEPTH = 3.0 # mm -- use front+back rows if depth exceeds this
+
+
+# ---------------------------------------------------------------------------
+# Working-copy creation (pipeline entry point)
+# ---------------------------------------------------------------------------
+
+# Matches the brick generator's "Metadata" group convention
+_METADATA_GROUP = "Metadata"
+
+PIPELINE_NAME = "print_pipeline"
+PIPELINE_VERSION = "1.0.0"
+
+
+def create_working_copy(source, name=None, doc=None):
+    """Deep-copy a FreeCAD object into a pipeline working copy.
+
+    Creates a new Part::Feature with an independent shape copy and adds
+    provenance properties following the same Metadata convention as the
+    brick generator (GeneratorName, GeneratorVersion, SourceObject, plus
+    PipelineSteps for tracking downstream operations).
+
+    The entire operation is wrapped in a single FreeCAD transaction, so
+    Ctrl+Z undoes it in one step.
+
+    Metadata properties added to the new object:
+
+    - **GeneratorName** (str): ``"print_pipeline"``
+    - **GeneratorVersion** (str): ``"1.0.0"``
+    - **SourceObject** (str): Label of the original object.
+    - **PipelineSteps** (str): Semicolon-separated log of steps applied,
+      e.g. ``"copy;orient;supports;raft"``.  Append via
+      `record_pipeline_step()`.
+
+    Parameters
+    ----------
+    source : str or App::DocumentObject
+        Object name (looked up in *doc*) or an existing document object.
+    name : str, optional
+        Label for the working copy.  Defaults to ``<source_label>_print``.
+    doc : App.Document, optional
+        Document to operate in.  Defaults to ``FreeCAD.ActiveDocument``.
+
+    Returns
+    -------
+    App::DocumentObject
+        The newly created Part::Feature with Metadata properties.
+    """
+    if doc is None:
+        doc = FreeCAD.ActiveDocument
+    if isinstance(source, str):
+        obj = doc.getObject(source)
+        if obj is None:
+            raise ValueError(f"Object '{source}' not found in document")
+    else:
+        obj = source
+
+    copy_label = name or f"{obj.Label}_print"
+
+    doc.openTransaction(f"Create working copy '{copy_label}'")
+    try:
+        copy_obj = doc.addObject("Part::Feature", copy_label)
+        copy_obj.Shape = obj.Shape.copy()
+
+        # Standard generator metadata (matches brick_generator convention)
+        copy_obj.addProperty(
+            "App::PropertyString", "GeneratorName", _METADATA_GROUP,
+            "Generator name")
+        copy_obj.GeneratorName = PIPELINE_NAME
+
+        copy_obj.addProperty(
+            "App::PropertyString", "GeneratorVersion", _METADATA_GROUP,
+            "Generator version")
+        copy_obj.GeneratorVersion = PIPELINE_VERSION
+
+        copy_obj.addProperty(
+            "App::PropertyString", "SourceObject", _METADATA_GROUP,
+            "Original object this copy was made from")
+        copy_obj.SourceObject = obj.Label
+
+        copy_obj.addProperty(
+            "App::PropertyString", "PipelineSteps", _METADATA_GROUP,
+            "Semicolon-separated log of pipeline steps applied")
+        copy_obj.PipelineSteps = "copy"
+
+        doc.recompute()
+        doc.commitTransaction()
+    except Exception:
+        doc.abortTransaction()
+        raise
+
+    logger.info("Working copy '%s' ← '%s' (%d solids)",
+                copy_label, obj.Label, len(copy_obj.Shape.Solids))
+    return copy_obj
+
+
+def record_pipeline_step(obj, step):
+    """Append a step name to an object's PipelineSteps provenance log.
+
+    Parameters
+    ----------
+    obj : App::DocumentObject
+        A working copy created by `create_working_copy()`.
+    step : str
+        Short token for the step, e.g. ``"orient"``, ``"split"``,
+        ``"supports"``, ``"pins"``, ``"raft"``.
+    """
+    existing = getattr(obj, "PipelineSteps", None)
+    if existing is None:
+        logger.warning("Object '%s' has no PipelineSteps property — skipping",
+                       obj.Label)
+        return
+    obj.PipelineSteps = f"{existing};{step}" if existing else step
 
 
 # ---------------------------------------------------------------------------

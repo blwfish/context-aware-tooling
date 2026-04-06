@@ -702,6 +702,42 @@ def make_tab_slot(center, plane_normal, wall_dir,
                          d_front=depth + clearance)
 
 
+def _measure_wall_thickness(shape, point, direction, max_probe=10.0):
+    """
+    Measure wall thickness at a point by probing along a direction.
+
+    Starting from a point on the interior surface, probes along
+    direction (into the wall) to find where the solid ends.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        The solid shape.
+    point : Vector
+        Start point on the interior surface.
+    direction : Vector
+        Unit vector pointing into the wall.
+    max_probe : float
+        Maximum probe distance.
+
+    Returns
+    -------
+    float
+        Wall thickness in mm.
+    """
+    d = Vector(direction)
+    d.normalize()
+    lo, hi = 0.0, max_probe
+    for _ in range(20):  # binary search
+        test = (lo + hi) / 2
+        probe = point + d * test
+        if shape.isInside(probe, 0.001, True):
+            lo = test
+        else:
+            hi = test
+    return (lo + hi) / 2
+
+
 def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
                                 tab_count=None):
     """
@@ -762,7 +798,7 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         (bb.ZMin + bb.ZMax) / 2,
     )
 
-    all_tab_params = []
+    all_tab_params = []  # list of (center, plane_normal, wall_dir, tab_height)
     for edge, _ in interior_edges:
         mid = edge.valueAt(
             edge.FirstParameter + (edge.LastParameter - edge.FirstParameter) / 2
@@ -782,6 +818,15 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         to_center.normalize()
         wall_dir = to_center * -1  # flip: into wall, not into hollow
 
+        # Measure wall thickness at edge midpoint by probing along wall_dir
+        wall_thickness = _measure_wall_thickness(neg_half, mid, wall_dir)
+        # Clamp tab height to at most half the wall thickness
+        # so the slot never breaks through to the exterior
+        tab_height = min(TAB_HEIGHT, wall_thickness / 2.0)
+        if tab_height < 0.1:
+            logger.warning(f"Wall too thin ({wall_thickness:.2f}mm) for tabs")
+            continue
+
         # Distribute tabs proportionally by edge length
         if tab_count is not None:
             edge_count = max(1, round(tab_count * edge.Length / total_interior_length))
@@ -789,7 +834,8 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
             edge_count = None
 
         tabs = _tab_positions_along_edge(edge, n, wall_dir, count=edge_count)
-        all_tab_params.extend(tabs)
+        for center, pn, wdir in tabs:
+            all_tab_params.append((center, pn, wdir, tab_height))
 
     if not all_tab_params:
         logger.warning("No tab positions found on interior edges")
@@ -797,9 +843,9 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
 
     tab_shapes = []
     slot_shapes = []
-    for center, pn, wdir in all_tab_params:
-        tab_shapes.append(make_tab(center, pn, wdir))
-        slot_shapes.append(make_tab_slot(center, pn, wdir))
+    for center, pn, wdir, th in all_tab_params:
+        tab_shapes.append(make_tab(center, pn, wdir, height=th))
+        slot_shapes.append(make_tab_slot(center, pn, wdir, height=th))
 
     # Fuse tabs onto negative half
     tab_compound = Part.Compound(tab_shapes)

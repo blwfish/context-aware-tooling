@@ -221,6 +221,33 @@ class TestMakeSprue:
 
 
 @freecad
+class TestLocalThickness:
+    def test_solid_plate_full_thickness(self, solid_plate):
+        # A solid plate should measure full thickness everywhere
+        pt = Vector(10, 0, 15)  # on the surface
+        t_off, t_size = sprue_utils._measure_local_thickness(
+            solid_plate, pt, Vector(0, 1, 0), 2.0)
+        assert t_off < 0.1
+        assert abs(t_size - 2.0) < 0.15  # within probe step
+
+    def test_no_material_returns_full_fallback(self):
+        # Probe outside any shape — should return full thickness fallback
+        box = Part.makeBox(5, 2, 5)
+        pt = Vector(100, 0, 100)  # far outside the box
+        t_off, t_size = sprue_utils._measure_local_thickness(
+            box, pt, Vector(0, 1, 0), 2.0)
+        assert abs(t_size - 2.0) < 0.01  # fallback to max
+
+    def test_gate_no_thicker_than_part(self, hollow_frame):
+        # Sprue gates should not exceed the part's local thickness
+        sprue = sprue_utils.make_sprue(hollow_frame, count=2, cols=2)
+        sprue_bb = sprue.BoundBox
+        part_bb = hollow_frame.BoundBox
+        # Overall sprue thickness should not exceed part thickness
+        assert sprue_bb.YLength <= part_bb.YLength + 0.01
+
+
+@freecad
 class TestPeelForceProfile:
     def test_solid_box_profile(self):
         box = Part.makeBox(10, 10, 20)

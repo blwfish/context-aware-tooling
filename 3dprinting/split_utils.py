@@ -49,6 +49,7 @@ TAB_HEIGHT = 1.0               # mm -- tab extent inward from wall interior edge
 TAB_CLEARANCE = 0.12           # mm -- slot oversize on each side
 TAB_SPACING = 10.0             # mm -- default spacing along interior edges
 TAB_EDGE_MARGIN = 2.0          # mm -- inset from ends of interior edges
+TAB_MIN_WALL = 0.8             # mm -- minimum wall thickness for tabs
 
 
 # ---------------------------------------------------------------------------
@@ -641,15 +642,17 @@ def _make_tab_box(center, plane_normal, wall_dir,
     return Part.makeSolid(shell)
 
 
+TAB_BASE = 0.3  # mm — shallow base anchoring tongue to source wall
+
+
 def make_tab(center, plane_normal, wall_dir,
              width=TAB_WIDTH, depth=TAB_DEPTH, height=TAB_HEIGHT):
     """
-    Make a registration tab that straddles the split plane.
+    Make a registration tab tongue with a shallow base.
 
-    The tab wraps the interior corner of the wall: it extends into
-    the wall material (for structural bond and slot engagement) and
-    protrudes from the split face in both directions (base on source
-    piece, tongue into mating piece).
+    The tongue protrudes from the source piece's split face into
+    the mating piece.  A shallow base (TAB_BASE) anchors it to the
+    source wall behind the split face.
 
     Parameters
     ----------
@@ -662,7 +665,7 @@ def make_tab(center, plane_normal, wall_dir,
     width : float
         Tab extent along the split edge.
     depth : float
-        Tab protrusion from the split face in each direction.
+        Tongue protrusion past the split face into the mating piece.
     height : float
         Tab extent into the wall from the interior edge.
 
@@ -671,7 +674,7 @@ def make_tab(center, plane_normal, wall_dir,
     Part.Shape
     """
     return _make_tab_box(center, plane_normal, wall_dir,
-                         width, height, d_back=depth, d_front=depth)
+                         width, height, d_back=TAB_BASE, d_front=depth)
 
 
 def make_tab_slot(center, plane_normal, wall_dir,
@@ -786,8 +789,11 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
                        "falling back to pin registration")
         return add_registration_plane(neg_half, pos_half, plane_point, n)
 
+    # Skip edges too short to hold a tab
+    interior_edges = [(e, c) for e, c in interior_edges
+                      if e.Length >= TAB_WIDTH]
     total_interior_length = sum(e.Length for e, _ in interior_edges)
-    logger.info(f"Found {len(interior_edges)} interior edges, "
+    logger.info(f"Found {len(interior_edges)} interior edges (>={TAB_WIDTH}mm), "
                 f"total length {total_interior_length:.1f}mm")
 
     # Compute interior direction for each edge (toward BB center)
@@ -798,7 +804,7 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         (bb.ZMin + bb.ZMax) / 2,
     )
 
-    all_tab_params = []  # list of (center, plane_normal, wall_dir, tab_height)
+    all_tab_params = []  # list of (center, plane_normal, wall_dir, tab_height, wall_thickness)
     for edge, _ in interior_edges:
         # Distribute tab positions along this edge
         if tab_count is not None:
@@ -827,10 +833,11 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
 
             # Measure wall thickness at this position
             wall_thickness = _measure_wall_thickness(neg_half, center, wall_dir)
-            tab_height = min(TAB_HEIGHT, wall_thickness / 2.0)
-            if tab_height < 0.1:
-                logger.warning(f"Wall too thin ({wall_thickness:.2f}mm) for tabs")
+            if wall_thickness < TAB_MIN_WALL:
+                logger.warning(f"Wall too thin ({wall_thickness:.2f}mm) for tabs, "
+                               f"need >={TAB_MIN_WALL}mm")
                 continue
+            tab_height = min(TAB_HEIGHT, wall_thickness / 2.0)
 
             all_tab_params.append((center, pn, wall_dir, tab_height))
 
@@ -842,6 +849,7 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
     slot_shapes = []
     for center, pn, wdir, th in all_tab_params:
         tab_shapes.append(make_tab(center, pn, wdir, height=th))
+        # Slot uses tab height — make_tab_slot adds clearance internally
         slot_shapes.append(make_tab_slot(center, pn, wdir, height=th))
 
     # Fuse tabs onto negative half

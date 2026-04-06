@@ -51,6 +51,16 @@ TAB_SPACING = 10.0             # mm -- default spacing along interior edges
 TAB_EDGE_MARGIN = 2.0          # mm -- inset from ends of interior edges
 TAB_MIN_WALL = 0.8             # mm -- minimum wall thickness for tabs
 
+# ---------------------------------------------------------------------------
+# Constants — blister registration
+# ---------------------------------------------------------------------------
+
+BLISTER_RADIUS = 1.5           # mm -- boss radius (must be > PIN_RADIUS)
+BLISTER_DEPTH = 1.5            # mm -- boss extent from split face into each half
+BLISTER_OVERLAP = 0.3          # mm -- embed into wall for solid bond
+BLISTER_SPACING = 15.0         # mm -- default spacing along interior edges
+BLISTER_EDGE_MARGIN = 3.0     # mm -- inset from ends of interior edges
+
 
 # ---------------------------------------------------------------------------
 # Model Splitting & Registration
@@ -861,6 +871,226 @@ def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
     pos_result = pos_half.cut(slot_compound)
 
     print(f"Added {len(all_tab_params)} registration tab/slot pairs "
+          f"on {len(interior_edges)} interior edges")
+    return neg_result, pos_result
+
+
+# ---------------------------------------------------------------------------
+# Blister registration — for thin-walled hollow structures
+# ---------------------------------------------------------------------------
+
+def make_blister(center, plane_normal, blister_dir,
+                 radius=BLISTER_RADIUS, depth=BLISTER_DEPTH,
+                 overlap=BLISTER_OVERLAP):
+    """
+    Make a blister (cylindrical boss) on the interior wall surface.
+
+    The blister is a cylinder with axis along plane_normal, offset
+    from the interior edge into the hollow.  It provides a mounting
+    platform for pin/socket registration where the native wall is
+    too thin.
+
+    Returns a pair of half-blisters (neg_side, pos_side) split at
+    the center point.
+
+    Parameters
+    ----------
+    center : Vector
+        Point on the interior edge at the split plane.
+    plane_normal : Vector
+        Direction from negative half toward positive half.
+    blister_dir : Vector
+        Direction from interior edge into the hollow (away from wall).
+    radius : float
+        Boss radius.
+    depth : float
+        How far the boss extends from the split plane into each half.
+    overlap : float
+        How much the boss overlaps into the wall for bonding.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_blister, pos_blister) — half-cylinders for each side.
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+    bd = Vector(blister_dir)
+    bd.normalize()
+
+    # Offset center into hollow, minus overlap so blister embeds into wall
+    blister_center = center + bd * (radius - overlap)
+
+    # Neg-side half: extends backward from split plane
+    neg_base = blister_center - n * depth
+    neg_blister = Part.makeCylinder(radius, depth, neg_base, n)
+
+    # Pos-side half: extends forward from split plane
+    pos_blister = Part.makeCylinder(radius, depth, blister_center, n)
+
+    return neg_blister, pos_blister
+
+
+def _blister_positions_along_edge(edge, plane_normal,
+                                  spacing=BLISTER_SPACING,
+                                  margin=BLISTER_EDGE_MARGIN,
+                                  count=None):
+    """
+    Distribute blister positions along an interior edge.
+
+    Parameters
+    ----------
+    edge : Part.Edge
+        The interior edge to place blisters along.
+    plane_normal : Vector
+        Split plane normal.
+    spacing : float
+        Nominal distance between blisters.
+    margin : float
+        Inset from edge ends.
+    count : int or None
+        Exact count. When None, derived from spacing.
+
+    Returns
+    -------
+    list of Vector
+        Blister center positions on the edge.
+    """
+    length = edge.Length
+    usable = length - 2 * margin
+    if usable < 0:
+        return []
+
+    if count is None:
+        count = max(1, round(usable / spacing))
+
+    if count == 1:
+        mid_param = (edge.FirstParameter + edge.LastParameter) / 2
+        return [edge.valueAt(mid_param)]
+
+    positions = []
+    for i in range(count):
+        t = margin + usable * i / (count - 1)
+        param = edge.getParameterByLength(t)
+        positions.append(edge.valueAt(param))
+    return positions
+
+
+def add_blister_registration_plane(neg_half, pos_half, plane_point,
+                                   plane_normal, blister_count=None):
+    """
+    Add blister + pin/socket registration on thin-walled interior edges.
+
+    For hollow models where the wall is too thin for tabs, this adds
+    cylindrical bosses (blisters) on the interior wall surface at the
+    split boundary, then places pin/socket pairs on the blister faces.
+
+    Parameters
+    ----------
+    neg_half, pos_half : Part.Shape
+        The two halves to register.
+    plane_point : Vector
+        A point on the split plane.
+    plane_normal : Vector
+        Normal vector (points from neg toward pos).
+    blister_count : int or None
+        Total number of blisters. When None, derived from spacing.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_with_blisters_and_pins, pos_with_blisters_and_sockets)
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+
+    # Find split face and interior edges
+    split_face = _find_split_face(neg_half, plane_point, n)
+    if split_face is None:
+        split_face = _find_split_face(pos_half, plane_point, n)
+    if split_face is None:
+        logger.warning("Could not find split face for blister placement")
+        return neg_half, pos_half
+
+    classes = _classify_split_face_edges(neg_half, split_face)
+    interior_edges = [(e, c) for e, c in classes if c == 'interior']
+    if not interior_edges:
+        logger.warning("No interior edges found — cannot place blisters")
+        return neg_half, pos_half
+
+    # Only use edges long enough for blisters
+    interior_edges = [(e, c) for e, c in interior_edges
+                      if e.Length >= 2 * BLISTER_EDGE_MARGIN]
+    total_interior_length = sum(e.Length for e, _ in interior_edges)
+
+    if total_interior_length < 1.0:
+        logger.warning("Interior edges too short for blisters")
+        return neg_half, pos_half
+
+    logger.info(f"Found {len(interior_edges)} interior edges for blisters, "
+                f"total length {total_interior_length:.1f}mm")
+
+    bb = neg_half.BoundBox
+    bb_center = Vector(
+        (bb.XMin + bb.XMax) / 2,
+        (bb.YMin + bb.YMax) / 2,
+        (bb.ZMin + bb.ZMax) / 2,
+    )
+
+    neg_blisters = []
+    pos_blisters = []
+    pin_shapes = []
+    socket_shapes = []
+
+    for edge, _ in interior_edges:
+        # Distribute blister count proportionally by edge length
+        if blister_count is not None:
+            edge_count = max(1, round(
+                blister_count * edge.Length / total_interior_length))
+        else:
+            edge_count = None
+
+        positions = _blister_positions_along_edge(
+            edge, n, count=edge_count)
+
+        for center in positions:
+            # Compute blister_dir (into hollow) at this position
+            to_center = bb_center - center
+            to_center = to_center - n * to_center.dot(n)
+            param = edge.Curve.parameter(center)
+            edge_tangent = edge.tangentAt(param)
+            to_center = to_center - edge_tangent * to_center.dot(edge_tangent)
+            if to_center.Length < 1e-6:
+                continue
+            to_center.normalize()
+            # blister_dir = toward BB center = into hollow
+            blister_dir = to_center
+
+            neg_b, pos_b = make_blister(center, n, blister_dir)
+            neg_blisters.append(neg_b)
+            pos_blisters.append(pos_b)
+
+            # Pin/socket at the blister face (at the split plane)
+            # Offset into hollow so pin sits on blister surface, not on wall
+            pin_center = center + blister_dir * (BLISTER_RADIUS - BLISTER_OVERLAP)
+            pin_shapes.append(make_pin(pin_center, n))
+            socket_shapes.append(make_socket(pin_center, n))
+
+    if not neg_blisters:
+        logger.warning("No blister positions found")
+        return neg_half, pos_half
+
+    # Fuse blisters + pins onto negative half
+    neg_compound = Part.Compound(neg_blisters + pin_shapes)
+    neg_result = neg_half.fuse(neg_compound)
+
+    # Fuse blisters onto positive half, then cut sockets
+    pos_compound = Part.Compound(pos_blisters)
+    pos_result = pos_half.fuse(pos_compound)
+    sock_compound = Part.Compound(socket_shapes)
+    pos_result = pos_result.cut(sock_compound)
+
+    print(f"Added {len(pin_shapes)} blister registration pairs "
           f"on {len(interior_edges)} interior edges")
     return neg_result, pos_result
 

@@ -81,6 +81,21 @@ def split_hollow_box(hollow_box):
     return neg, pos
 
 
+@pytest.fixture
+def hollow_cylinder():
+    """A hollow cylinder (0.5mm walls) for blister tests."""
+    outer = Part.makeCylinder(8.0, 50.0, Vector(0, 0, 0), Vector(1, 0, 0))
+    inner = Part.makeCylinder(7.5, 50.0, Vector(0, 0, 0), Vector(1, 0, 0))
+    return outer.cut(inner)
+
+
+@pytest.fixture
+def split_hollow_cylinder(hollow_cylinder):
+    """Hollow cylinder split at x=25."""
+    neg, pos = split_utils.split_model(hollow_cylinder, 'x', 25.0)
+    return neg, pos
+
+
 # ---------------------------------------------------------------------------
 # Splitting tests
 # ---------------------------------------------------------------------------
@@ -324,6 +339,131 @@ class TestTabRegistration:
             neg, pos, Vector(30, 0, 0), Vector(1, 0, 0))
         # Should still produce registration (pin fallback)
         assert neg_r.Volume > neg.Volume or pos_r.Volume < pos.Volume
+
+
+# ---------------------------------------------------------------------------
+# Tab refinements (TAB_BASE, TAB_MIN_WALL, short edge filter)
+# ---------------------------------------------------------------------------
+
+@freecad
+class TestTabRefinements:
+    def test_tab_base_is_shallow(self):
+        """Tab should have a shallow base (TAB_BASE), not full depth."""
+        tab = split_utils.make_tab(
+            Vector(10, 0, 5), Vector(1, 0, 0), Vector(0, -1, 0))
+        bb = tab.BoundBox
+        # Base side: should extend only TAB_BASE (0.3mm) behind split plane
+        assert bb.XMin > 10.0 - split_utils.TAB_BASE - 0.01
+        # Tongue side: extends full TAB_DEPTH (1.5mm) forward
+        assert bb.XMax > 10.0 + split_utils.TAB_DEPTH - 0.1
+
+    def test_tab_skips_thin_walls(self, split_hollow_cylinder):
+        """Tabs should be skipped where wall < TAB_MIN_WALL."""
+        neg, pos = split_hollow_cylinder
+        # Cylinder has 0.5mm walls — below TAB_MIN_WALL (0.8mm)
+        neg_r, pos_r = split_utils.add_tab_registration_plane(
+            neg, pos, Vector(25, 0, 0), Vector(1, 0, 0), tab_count=4)
+        # All positions skipped — volumes unchanged (use blisters instead)
+        assert abs(neg_r.Volume - neg.Volume) < 0.01
+        assert abs(pos_r.Volume - pos.Volume) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Blister geometry
+# ---------------------------------------------------------------------------
+
+@freecad
+class TestBlisterlGeometry:
+    def test_make_blister_returns_two_solids(self):
+        neg_b, pos_b = split_utils.make_blister(
+            Vector(0, 0, 0), Vector(0, 0, 1), Vector(0, 1, 0))
+        assert len(neg_b.Solids) == 1
+        assert len(pos_b.Solids) == 1
+
+    def test_blister_halves_equal_volume(self):
+        neg_b, pos_b = split_utils.make_blister(
+            Vector(0, 0, 0), Vector(0, 0, 1), Vector(0, 1, 0))
+        assert abs(neg_b.Volume - pos_b.Volume) < 0.01
+
+    def test_blister_straddles_split_plane(self):
+        neg_b, pos_b = split_utils.make_blister(
+            Vector(0, 0, 0), Vector(0, 0, 1), Vector(0, 1, 0))
+        # neg extends below z=0, pos extends above
+        assert neg_b.BoundBox.ZMin < 0.0
+        assert neg_b.BoundBox.ZMax <= 0.01
+        assert pos_b.BoundBox.ZMin >= -0.01
+        assert pos_b.BoundBox.ZMax > 0.0
+
+    def test_blister_offset_into_hollow(self):
+        """Blister center should be offset from edge into the hollow."""
+        center = Vector(10, 0, 0)
+        blister_dir = Vector(0, 1, 0)
+        neg_b, pos_b = split_utils.make_blister(
+            center, Vector(1, 0, 0), blister_dir)
+        # Blister should extend in +Y (blister_dir)
+        expected_offset = split_utils.BLISTER_RADIUS - split_utils.BLISTER_OVERLAP
+        assert pos_b.BoundBox.YMax > expected_offset
+
+
+# ---------------------------------------------------------------------------
+# Blister positions
+# ---------------------------------------------------------------------------
+
+@freecad
+class TestBlisterPositions:
+    def test_positions_along_edge(self, split_hollow_cylinder):
+        neg, _ = split_hollow_cylinder
+        face = split_utils._find_split_face(neg, Vector(25, 0, 0), Vector(1, 0, 0))
+        classes = split_utils._classify_split_face_edges(neg, face)
+        interior = [e for e, c in classes if c == 'interior']
+        assert len(interior) > 0
+        edge = interior[0]
+        positions = split_utils._blister_positions_along_edge(
+            edge, Vector(1, 0, 0), count=4)
+        assert len(positions) == 4
+
+    def test_single_position_at_midpoint(self, split_hollow_cylinder):
+        neg, _ = split_hollow_cylinder
+        face = split_utils._find_split_face(neg, Vector(25, 0, 0), Vector(1, 0, 0))
+        classes = split_utils._classify_split_face_edges(neg, face)
+        interior = [e for e, c in classes if c == 'interior']
+        edge = interior[0]
+        positions = split_utils._blister_positions_along_edge(
+            edge, Vector(1, 0, 0), count=1)
+        assert len(positions) == 1
+
+
+# ---------------------------------------------------------------------------
+# Blister registration pipeline
+# ---------------------------------------------------------------------------
+
+@freecad
+class TestBlisterlRegistration:
+    def test_blister_registration_on_cylinder(self, split_hollow_cylinder):
+        neg, pos = split_hollow_cylinder
+        neg_r, pos_r = split_utils.add_blister_registration_plane(
+            neg, pos, Vector(25, 0, 0), Vector(1, 0, 0), blister_count=4)
+        # neg gains blisters + pins
+        assert neg_r.Volume > neg.Volume
+        # pos gains blisters but loses sockets
+        # net should still be positive (blisters add more than sockets remove)
+        assert pos_r.Volume > pos.Volume
+
+    def test_blister_preserves_single_solid(self, split_hollow_cylinder):
+        neg, pos = split_hollow_cylinder
+        neg_r, pos_r = split_utils.add_blister_registration_plane(
+            neg, pos, Vector(25, 0, 0), Vector(1, 0, 0), blister_count=4)
+        assert len(neg_r.Solids) == 1
+        assert len(pos_r.Solids) == 1
+
+    def test_blister_on_solid_returns_unchanged(self, split_solid_box):
+        """Solid cross-section has no interior edges — should return unchanged."""
+        neg, pos = split_solid_box
+        neg_r, pos_r = split_utils.add_blister_registration_plane(
+            neg, pos, Vector(30, 0, 0), Vector(1, 0, 0))
+        # No interior edges, so no blisters added
+        assert abs(neg_r.Volume - neg.Volume) < 0.01
+        assert abs(pos_r.Volume - pos.Volume) < 0.01
 
 
 # ---------------------------------------------------------------------------

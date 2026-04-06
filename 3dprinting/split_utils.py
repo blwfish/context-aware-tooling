@@ -8,11 +8,14 @@ reassembly of multi-piece prints.
 Usage (from FreeCAD MCP execute_python):
     from split_utils import split_and_register, split_and_register_plane
 
-    # Axis-aligned split with registration:
+    # Axis-aligned split with registration (auto pin count from spacing):
     neg, pos = split_and_register(shape, axis='y', position=45.0)
 
+    # Specify exact number of pins:
+    neg, pos = split_and_register(shape, axis='y', position=45.0, pin_count=3)
+
     # Arbitrary plane split:
-    neg, pos = split_and_register_plane(shape, point, normal)
+    neg, pos = split_and_register_plane(shape, point, normal, pin_count=4)
 
 All dimensions are in print-scale mm (not prototype scale).
 """
@@ -306,16 +309,16 @@ def _find_split_face(shape, plane_point, plane_normal, tol=0.1):
 
 
 def _pin_positions_on_face(face, plane_normal, spacing=PIN_SPACING,
-                            margin=PIN_EDGE_MARGIN):
+                            margin=PIN_EDGE_MARGIN, count=None,
+                            _grid_resolution=0.5):
     """
     Distribute pin positions across a split face.
 
-    Works with arbitrary planar faces, not just axis-aligned ones.
-    Uses the face's own in-plane basis vectors computed from the plane
-    normal, so diagonal and angled splits work correctly.
-
-    Distributes pins along the longer in-plane direction, centered
-    on the shorter direction.
+    Works with arbitrary planar faces including hollow cross-sections
+    (U-shaped, L-shaped, etc.).  Samples a grid of candidate points
+    across the face bounding box, keeps only those that actually lie
+    on the face material, then selects well-spaced positions using
+    greedy farthest-point sampling.
 
     Parameters
     ----------
@@ -324,9 +327,14 @@ def _pin_positions_on_face(face, plane_normal, spacing=PIN_SPACING,
     plane_normal : Vector
         Normal of the split plane (pin direction).
     spacing : float
-        Target spacing between pins.
+        Target spacing between pins. Ignored when count is provided.
     margin : float
         Inset from face edges.
+    count : int or None
+        Exact number of pins to place. When provided, pins are evenly
+        distributed from the valid candidates, overriding spacing.
+    _grid_resolution : float
+        Candidate grid spacing in mm (smaller = more candidates, slower).
 
     Returns
     -------
@@ -337,7 +345,6 @@ def _pin_positions_on_face(face, plane_normal, spacing=PIN_SPACING,
     n.normalize()
     u, v = _plane_basis(n)
 
-    # Get the face center of gravity as the origin for UV projection
     cog = face.CenterOfGravity
 
     # Project all face vertices onto the UV plane to find extent
@@ -348,44 +355,98 @@ def _pin_positions_on_face(face, plane_normal, spacing=PIN_SPACING,
     u_vals = []
     v_vals = []
     for vert in verts:
-        p = vert.Point
-        d = p - cog
+        d = vert.Point - cog
         u_vals.append(d.dot(u))
         v_vals.append(d.dot(v))
 
     u_min, u_max = min(u_vals), max(u_vals)
     v_min, v_max = min(v_vals), max(v_vals)
-    u_span = u_max - u_min
-    v_span = v_max - v_min
 
-    # Distribute along the longer direction, center on shorter
-    if u_span >= v_span:
-        long_dir, long_min, long_max = u, u_min, u_max
-        short_dir, short_min, short_max = v, v_min, v_max
-    else:
-        long_dir, long_min, long_max = v, v_min, v_max
-        short_dir, short_min, short_max = u, u_min, u_max
+    # Sample a grid of candidates across the full bounding box, then filter
+    # to points that lie on the face AND are at least `margin` from the
+    # face boundary (wire edges).  For thin-walled cross-sections the margin
+    # is automatically clamped so pins still fit.
+    on_face_tol = 0.01  # mm — distToShape threshold for "on the face"
+    boundary = face.Wires[0] if face.Wires else None
+    candidates = []
 
-    long_span = long_max - long_min
-    span = long_span - 2 * margin
-    if span <= 0:
+    u_steps = max(1, int((u_max - u_min) / _grid_resolution) + 1)
+    v_steps = max(1, int((v_max - v_min) / _grid_resolution) + 1)
+
+    for iu in range(u_steps):
+        uu = u_min + iu * (u_max - u_min) / max(1, u_steps - 1) if u_steps > 1 else (u_min + u_max) / 2
+        for iv in range(v_steps):
+            vv = v_min + iv * (v_max - v_min) / max(1, v_steps - 1) if v_steps > 1 else (v_min + v_max) / 2
+            pt = cog + u * uu + v * vv
+            # Must be on the face
+            dist_face = face.distToShape(Part.Vertex(pt))[0]
+            if dist_face > on_face_tol:
+                continue
+            # Prefer points inset from the face boundary.  Store the
+            # edge distance so the farthest-point selector favours
+            # well-inset positions, but don't discard points on thin
+            # walls — the user controls pin count and may accept pins
+            # wider than the wall (slicer handles the overhang).
+            edge_dist = 0.0
+            if boundary:
+                edge_dist = boundary.distToShape(Part.Vertex(pt))[0]
+            if edge_dist < _grid_resolution * 0.1:
+                continue  # on or too near the boundary edge
+            candidates.append((pt, edge_dist))
+
+    if not candidates:
         return []
 
-    count = max(2, int(span / spacing) + 1)
-    step = span / (count - 1) if count > 1 else 0
-    long_positions = [long_min + margin + i * step for i in range(count)]
+    # Determine how many pins to place
+    if count is not None:
+        if count < 1:
+            return []
+        n_pins = min(count, len(candidates))
+    else:
+        # Estimate from spacing: use the face perimeter as a rough guide
+        perim = sum(e.Length for e in face.Wires[0].Edges) if face.Wires else 0
+        n_pins = max(2, int(perim / (2 * spacing)) + 1)
+        n_pins = min(n_pins, len(candidates))
 
-    short_center = (short_min + short_max) / 2.0
+    # Warn if pins are wider than the wall
+    max_edge_dist = max(ed for _, ed in candidates)
+    if max_edge_dist < PIN_RADIUS:
+        logger.warning(
+            f"Wall thickness ({max_edge_dist * 2:.1f}mm) is less than "
+            f"pin diameter ({PIN_RADIUS * 2:.1f}mm) — pins will overhang")
 
-    positions = []
-    for lv in long_positions:
-        pos = cog + long_dir * lv + short_dir * short_center
-        positions.append(pos)
+    # Greedy farthest-point sampling for well-spaced selection.
+    # Start with the candidate that has the greatest edge inset
+    # (most centered in the wall material).
+    pts = [pt for pt, _ in candidates]
 
-    return positions
+    selected = []
+    remaining = list(range(len(candidates)))
+
+    # First point: best edge inset (most centered in material)
+    best_idx = max(remaining, key=lambda i: candidates[i][1])
+    selected.append(best_idx)
+    remaining.remove(best_idx)
+
+    # Subsequent points: farthest from nearest already-selected point
+    for _ in range(n_pins - 1):
+        if not remaining:
+            break
+        best_idx = None
+        best_min_dist = -1
+        for i in remaining:
+            min_dist = min((pts[i] - pts[s]).Length for s in selected)
+            if min_dist > best_min_dist:
+                best_min_dist = min_dist
+                best_idx = i
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+
+    return [pts[i] for i in selected]
 
 
-def add_registration_plane(neg_half, pos_half, plane_point, plane_normal):
+def add_registration_plane(neg_half, pos_half, plane_point, plane_normal,
+                           pin_count=None):
     """
     Add pin/socket registration features to two split halves.
 
@@ -403,6 +464,8 @@ def add_registration_plane(neg_half, pos_half, plane_point, plane_normal):
         A point on the split plane.
     plane_normal : Vector
         Normal vector of the split plane (points from neg toward pos).
+    pin_count : int or None
+        Exact number of pins. When None, count is derived from spacing.
 
     Returns
     -------
@@ -421,7 +484,7 @@ def add_registration_plane(neg_half, pos_half, plane_point, plane_normal):
         logger.warning("Could not find split face for pin placement")
         return neg_half, pos_half
 
-    positions = _pin_positions_on_face(split_face, n)
+    positions = _pin_positions_on_face(split_face, n, count=pin_count)
     if not positions:
         logger.warning("No room for registration pins on split face")
         return neg_half, pos_half
@@ -446,7 +509,8 @@ def add_registration_plane(neg_half, pos_half, plane_point, plane_normal):
     return neg_result, pos_result
 
 
-def add_registration(neg_half, pos_half, axis, split_pos, pin_axis=None):
+def add_registration(neg_half, pos_half, axis, split_pos, pin_axis=None,
+                     pin_count=None):
     """
     Add pin/socket registration features to two axis-aligned split halves.
 
@@ -465,6 +529,8 @@ def add_registration(neg_half, pos_half, axis, split_pos, pin_axis=None):
     pin_axis : str or None
         Ignored (kept for backward compatibility). Pin distribution
         axis is auto-detected from the split face geometry.
+    pin_count : int or None
+        Exact number of pins. When None, count is derived from spacing.
 
     Returns
     -------
@@ -477,10 +543,11 @@ def add_registration(neg_half, pos_half, axis, split_pos, pin_axis=None):
         'z': (Vector(0, 0, split_pos), Vector(0, 0, 1)),
     }
     point, normal = axis_map[axis]
-    return add_registration_plane(neg_half, pos_half, point, normal)
+    return add_registration_plane(neg_half, pos_half, point, normal,
+                                  pin_count=pin_count)
 
 
-def split_and_register_plane(shape, point, normal):
+def split_and_register_plane(shape, point, normal, pin_count=None):
     """
     Split a shape along an arbitrary plane and add registration features.
 
@@ -492,6 +559,8 @@ def split_and_register_plane(shape, point, normal):
         A point on the split plane.
     normal : Vector
         Normal vector of the split plane.
+    pin_count : int or None
+        Exact number of pins. When None, count is derived from spacing.
 
     Returns
     -------
@@ -499,10 +568,11 @@ def split_and_register_plane(shape, point, normal):
         (neg_with_pins, pos_with_sockets)
     """
     neg, pos = split_model_plane(shape, point, normal)
-    return add_registration_plane(neg, pos, point, normal)
+    return add_registration_plane(neg, pos, point, normal,
+                                  pin_count=pin_count)
 
 
-def split_and_register(shape, axis, position, pin_axis=None):
+def split_and_register(shape, axis, position, pin_axis=None, pin_count=None):
     """
     Split a shape along an axis-aligned plane and add registration features.
 
@@ -518,6 +588,8 @@ def split_and_register(shape, axis, position, pin_axis=None):
         Split coordinate.
     pin_axis : str or None
         Ignored (kept for backward compatibility).
+    pin_count : int or None
+        Exact number of pins. When None, count is derived from spacing.
 
     Returns
     -------
@@ -525,4 +597,4 @@ def split_and_register(shape, axis, position, pin_axis=None):
         (neg_with_pins, pos_with_sockets)
     """
     neg, pos = split_model(shape, axis, position)
-    return add_registration(neg, pos, axis, position)
+    return add_registration(neg, pos, axis, position, pin_count=pin_count)

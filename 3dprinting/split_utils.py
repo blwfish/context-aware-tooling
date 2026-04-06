@@ -39,6 +39,17 @@ PIN_CLEARANCE = 0.12           # mm radial clearance for socket
 PIN_SPACING = 15.0             # mm default spacing along split edge
 PIN_EDGE_MARGIN = 3.0          # mm inset from ends of split edge
 
+# ---------------------------------------------------------------------------
+# Constants — tab/slot registration
+# ---------------------------------------------------------------------------
+
+TAB_WIDTH = 2.0                # mm -- tab extent along the split edge
+TAB_DEPTH = 1.5                # mm -- tab protrusion from split face
+TAB_HEIGHT = 1.0               # mm -- tab extent inward from wall interior edge
+TAB_CLEARANCE = 0.12           # mm -- slot oversize on each side
+TAB_SPACING = 10.0             # mm -- default spacing along interior edges
+TAB_EDGE_MARGIN = 2.0          # mm -- inset from ends of interior edges
+
 
 # ---------------------------------------------------------------------------
 # Model Splitting & Registration
@@ -443,6 +454,361 @@ def _pin_positions_on_face(face, plane_normal, spacing=PIN_SPACING,
         remaining.remove(best_idx)
 
     return [pts[i] for i in selected]
+
+
+# ---------------------------------------------------------------------------
+# Interior edge detection
+# ---------------------------------------------------------------------------
+
+def _classify_split_face_edges(shape, split_face):
+    """
+    Classify each edge of the split face as INTERIOR or EXTERIOR.
+
+    Uses the adjacent face normal direction relative to the shape's
+    bounding box center.  Interior wall faces have outward normals
+    pointing toward the enclosed volume (toward BB center); exterior
+    wall faces have normals pointing away.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        The full split-half shape (provides adjacent faces and BB).
+    split_face : Part.Face
+        The planar face lying on the split plane.
+
+    Returns
+    -------
+    list of (Part.Edge, str)
+        Each entry is (edge, 'interior' or 'exterior').
+    """
+    bb = shape.BoundBox
+    bb_center = Vector(
+        (bb.XMin + bb.XMax) / 2,
+        (bb.YMin + bb.YMax) / 2,
+        (bb.ZMin + bb.ZMax) / 2,
+    )
+
+    results = []
+    for edge in split_face.Edges:
+        mid = edge.valueAt(
+            edge.FirstParameter + (edge.LastParameter - edge.FirstParameter) / 2
+        )
+
+        classified = False
+        for face in shape.Faces:
+            if face.isSame(split_face):
+                continue
+            if not any(fe.isSame(edge) for fe in face.Edges):
+                continue
+
+            try:
+                uv = face.Surface.parameter(mid)
+                normal = face.normalAt(uv[0], uv[1])
+            except Exception:
+                continue
+
+            # Outward normal pointing toward BB center → interior face
+            to_center = bb_center - mid
+            dot = normal.dot(to_center)
+            results.append((edge, 'interior' if dot > 0 else 'exterior'))
+            classified = True
+            break
+
+        if not classified:
+            results.append((edge, 'exterior'))
+
+    return results
+
+
+def _tab_positions_along_edge(edge, plane_normal, interior_dir,
+                               spacing=TAB_SPACING, margin=TAB_EDGE_MARGIN,
+                               count=None):
+    """
+    Compute tab center positions along an interior edge of the split face.
+
+    Parameters
+    ----------
+    edge : Part.Edge
+        The interior edge to distribute tabs along.
+    plane_normal : Vector
+        Normal of the split plane (tab protrusion direction).
+    interior_dir : Vector
+        Direction from the edge toward the model interior (for tab offset).
+    spacing : float
+        Target spacing between tabs.
+    margin : float
+        Inset from edge endpoints.
+    count : int or None
+        Exact number of tabs on this edge. If None, derived from spacing.
+
+    Returns
+    -------
+    list of (Vector, Vector, Vector)
+        Each entry is (center, plane_normal, interior_dir) — the tab
+        center on the split face, the protrusion direction, and the
+        inward direction for tab height.
+    """
+    length = edge.Length
+    span = length - 2 * margin
+    if span <= 0:
+        return []
+
+    if count is not None:
+        n_tabs = max(1, count)
+    else:
+        n_tabs = max(1, int(span / spacing) + 1)
+
+    if n_tabs == 1:
+        params = [edge.FirstParameter +
+                  (edge.LastParameter - edge.FirstParameter) / 2]
+    else:
+        step = span / (n_tabs - 1)
+        p0 = edge.FirstParameter
+        p1 = edge.LastParameter
+        param_margin = margin / length * (p1 - p0) if length > 0 else 0
+        params = [p0 + param_margin + i * step / length * (p1 - p0)
+                  for i in range(n_tabs)]
+
+    positions = []
+    for param in params:
+        pt = edge.valueAt(param)
+        positions.append((pt, Vector(plane_normal), Vector(interior_dir)))
+
+    return positions
+
+
+def _make_tab_box(center, plane_normal, interior_dir,
+                  width, height, d_back, d_front):
+    """
+    Build a solid box for a tab or slot, straddling the split plane.
+
+    The box extends from -d_back to +d_front along plane_normal,
+    ±width/2 along the edge, and height inward from the interior edge.
+
+    Parameters
+    ----------
+    center : Vector
+        Center of the tab on the split face, at the interior wall edge.
+    plane_normal : Vector
+        Direction from negative half toward positive half.
+    interior_dir : Vector
+        Direction toward the model interior.
+    width : float
+        Extent along the split edge.
+    height : float
+        Extent inward from the wall edge.
+    d_back : float
+        Extent behind the split face (into the source piece).
+    d_front : float
+        Extent in front of the split face (into the mating piece).
+
+    Returns
+    -------
+    Part.Shape
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+    inward = Vector(interior_dir)
+    inward.normalize()
+    along_edge = n.cross(inward)
+    along_edge.normalize()
+
+    hw = width / 2
+    corners = [
+        center + along_edge * s * hw + inward * h + n * d
+        for s in (-1, 1)
+        for h in (0, height)
+        for d in (-d_back, d_front)
+    ]
+
+    def _quad(a, b, c, d):
+        wire = Part.makePolygon([a, b, c, d, a])
+        return Part.Face(wire)
+
+    # Corner indices: (s, h, d) -> index
+    # (-1,0,-B)=0, (-1,0,+F)=1, (-1,H,-B)=2, (-1,H,+F)=3
+    # (+1,0,-B)=4, (+1,0,+F)=5, (+1,H,-B)=6, (+1,H,+F)=7
+    c = corners
+    faces = [
+        _quad(c[0], c[1], c[3], c[2]),  # -edge face
+        _quad(c[4], c[6], c[7], c[5]),  # +edge face
+        _quad(c[0], c[4], c[5], c[1]),  # bottom (h=0)
+        _quad(c[2], c[3], c[7], c[6]),  # top (h=H)
+        _quad(c[0], c[2], c[6], c[4]),  # back (d=-B)
+        _quad(c[1], c[5], c[7], c[3]),  # front (d=+F)
+    ]
+    shell = Part.makeShell(faces)
+    return Part.makeSolid(shell)
+
+
+def make_tab(center, plane_normal, interior_dir,
+             width=TAB_WIDTH, depth=TAB_DEPTH, height=TAB_HEIGHT):
+    """
+    Make a registration tab that straddles the split plane.
+
+    The tab is a rectangular shelf on the interior side of the wall,
+    extending backward (base bonded to source wall) and forward
+    (tongue that slots into mating piece).
+
+    Parameters
+    ----------
+    center : Vector
+        Center of the tab on the split face, at the interior wall edge.
+    plane_normal : Vector
+        Direction from negative half toward positive half.
+    interior_dir : Vector
+        Direction toward the model interior.
+    width : float
+        Tab extent along the split edge.
+    depth : float
+        Tab protrusion from the split face in each direction.
+    height : float
+        Tab extent inward from the wall edge.
+
+    Returns
+    -------
+    Part.Shape
+    """
+    return _make_tab_box(center, plane_normal, interior_dir,
+                         width, height, d_back=depth, d_front=depth)
+
+
+def make_tab_slot(center, plane_normal, interior_dir,
+                  width=TAB_WIDTH, depth=TAB_DEPTH, height=TAB_HEIGHT,
+                  clearance=TAB_CLEARANCE):
+    """
+    Make a slot matching a registration tab, with clearance.
+
+    The slot extends from the split face into the mating piece only
+    (the forward half), oversized by clearance for fit.
+
+    Parameters
+    ----------
+    center, plane_normal, interior_dir, width, depth, height :
+        Same as make_tab.
+    clearance : float
+        Oversize on each side for fit.
+
+    Returns
+    -------
+    Part.Shape
+        Solid to be subtracted (boolean cut) from the mating piece.
+    """
+    return _make_tab_box(center, plane_normal, interior_dir,
+                         width=width + 2 * clearance,
+                         height=height + clearance,
+                         d_back=clearance,  # slight cut past split face
+                         d_front=depth + clearance)
+
+
+def add_tab_registration_plane(neg_half, pos_half, plane_point, plane_normal,
+                                tab_count=None):
+    """
+    Add tab/slot registration features on interior edges of two split halves.
+
+    Tabs protrude from the negative half into slots cut into the
+    positive half.  All registration geometry is on the interior side
+    of the wall, keeping the exterior surface clean.
+
+    Parameters
+    ----------
+    neg_half : Part.Shape
+        The side opposite to the plane normal.
+    pos_half : Part.Shape
+        The side the plane normal points toward.
+    plane_point : Vector
+        A point on the split plane.
+    plane_normal : Vector
+        Normal vector of the split plane (points from neg toward pos).
+    tab_count : int or None
+        Total number of tabs. Distributed proportionally across
+        interior edges by length.  When None, derived from spacing.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_with_tabs, pos_with_slots)
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+
+    # Find the split face
+    split_face = _find_split_face(neg_half, plane_point, n)
+    if split_face is None:
+        split_face = _find_split_face(pos_half, plane_point, n)
+    if split_face is None:
+        logger.warning("Could not find split face for tab placement")
+        return neg_half, pos_half
+
+    # Classify edges as interior/exterior
+    edge_classes = _classify_split_face_edges(neg_half, split_face)
+    interior_edges = [(e, c) for e, c in edge_classes if c == 'interior']
+
+    if not interior_edges:
+        logger.warning("No interior edges found on split face — "
+                       "falling back to pin registration")
+        return add_registration_plane(neg_half, pos_half, plane_point, n)
+
+    total_interior_length = sum(e.Length for e, _ in interior_edges)
+    logger.info(f"Found {len(interior_edges)} interior edges, "
+                f"total length {total_interior_length:.1f}mm")
+
+    # Compute interior direction for each edge (toward BB center)
+    bb = neg_half.BoundBox
+    bb_center = Vector(
+        (bb.XMin + bb.XMax) / 2,
+        (bb.YMin + bb.YMax) / 2,
+        (bb.ZMin + bb.ZMax) / 2,
+    )
+
+    all_tab_params = []
+    for edge, _ in interior_edges:
+        mid = edge.valueAt(
+            edge.FirstParameter + (edge.LastParameter - edge.FirstParameter) / 2
+        )
+        # Interior direction: from the edge toward BB center,
+        # projected onto the split plane
+        to_center = bb_center - mid
+        # Remove component along plane normal
+        to_center = to_center - n * to_center.dot(n)
+        # Remove component along the edge direction
+        edge_dir = edge.tangentAt(edge.FirstParameter)
+        to_center = to_center - edge_dir * to_center.dot(edge_dir)
+        if to_center.Length < 1e-6:
+            continue
+        to_center.normalize()
+        interior_dir = to_center
+
+        # Distribute tabs proportionally by edge length
+        if tab_count is not None:
+            edge_count = max(1, round(tab_count * edge.Length / total_interior_length))
+        else:
+            edge_count = None
+
+        tabs = _tab_positions_along_edge(edge, n, interior_dir, count=edge_count)
+        all_tab_params.extend(tabs)
+
+    if not all_tab_params:
+        logger.warning("No tab positions found on interior edges")
+        return neg_half, pos_half
+
+    tab_shapes = []
+    slot_shapes = []
+    for center, pn, indir in all_tab_params:
+        tab_shapes.append(make_tab(center, pn, indir))
+        slot_shapes.append(make_tab_slot(center, pn, indir))
+
+    # Fuse tabs onto negative half
+    tab_compound = Part.Compound(tab_shapes)
+    neg_result = neg_half.fuse(tab_compound)
+
+    # Cut slots from positive half
+    slot_compound = Part.Compound(slot_shapes)
+    pos_result = pos_half.cut(slot_compound)
+
+    print(f"Added {len(all_tab_params)} registration tab/slot pairs "
+          f"on {len(interior_edges)} interior edges")
+    return neg_result, pos_result
 
 
 def add_registration_plane(neg_half, pos_half, plane_point, plane_normal,

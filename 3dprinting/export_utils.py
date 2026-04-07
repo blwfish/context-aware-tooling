@@ -45,12 +45,7 @@ DEFAULT_ANGULAR_DEFLECTION = 0.3    # radians (~17°)
 # relative to (0,0,0); a small margin avoids edge-clipping artifacts.
 DEFAULT_ORIGIN_MARGIN = 0.5         # mm
 
-# Known printer build volumes (duplicated from support_utils to keep
-# this module importable independently)
-PRINTER_VOLUMES = {
-    'm7_pro': (218.0, 123.0, 260.0),
-    'm7_max': (298.0, 164.0, 300.0),
-}
+from constants import PRINTER_VOLUMES
 
 
 # ---------------------------------------------------------------------------

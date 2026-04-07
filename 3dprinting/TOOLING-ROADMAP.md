@@ -1,7 +1,7 @@
 # 3D Print Tooling Roadmap
 
 Status of the automated print pipeline and planned improvements.
-Last updated: 2026-04-06.
+Last updated: 2026-04-06 (refactored: split_utils decomposed, constants centralized).
 
 ## Pipeline Overview
 
@@ -21,8 +21,14 @@ Source model
 
 | Module | Status | Notes |
 |--------|--------|-------|
+| `constants.py` | Working | Shared constants (printer volumes, pipeline metadata) |
+| `pipeline.py` | Working | Pipeline infrastructure (working copy, provenance, build fit) |
+| `split.py` | Working | Model splitting (arbitrary plane, axis-aligned) |
+| `registration.py` | Working | Pin/socket, tab/slot, blister registration features |
+| `bracing.py` | Working | Temporary sprue runner bracing for split pieces |
+| `split_utils.py` | Shim | Re-export shim for backward compatibility |
+| `export_utils.py` | Working | STL export pipeline (shift, tessellate, validate, write) |
 | `auto_slice.py` | Working | Tilt envelope, detail zone avoidance, cut planning |
-| `split_utils.py` | Working | Split, pin/socket/tab/blister registration, bracing |
 | `support_utils.py` | Working | Context-aware supports, face classification, collision detection |
 | `sprue_utils.py` | Working | Batch runner/gate frames for multi-copy prints |
 | `generate_building_print.py` | Working | SecondaryBuilding-specific orchestration |
@@ -32,8 +38,7 @@ Source model
 
 ### Pipeline gaps
 
-- **STL export function** — Currently ad hoc. Need: shift to all-positive coords,
-  validate mesh, export. Simple but needs to be a reusable function.
+- ~~**STL export function**~~ Done (`export_utils.py`).
 
 - **Pipeline orchestrator** — `generate_building_print.py` is model-specific.
   Need a general pipeline: model → slice → split → register → brace → orient →

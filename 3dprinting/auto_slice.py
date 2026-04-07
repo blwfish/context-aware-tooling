@@ -31,12 +31,7 @@ DETAIL_CLEARANCE = 3.0         # mm — min distance from cut to detail zone
 MIN_PIECE_DIMENSION = 15.0     # mm — don't create slivers
 VOLUME_THRESHOLD = 10.0        # mm³ — solids below this are "detail"
 
-# Printer build volumes (duplicated from support_utils to keep this module
-# importable without FreeCAD)
-PRINTER_VOLUMES = {
-    'm7_pro': (218.0, 123.0, 260.0),
-    'm7_max': (298.0, 164.0, 300.0),
-}
+from constants import PRINTER_VOLUMES
 
 # Axis name → index mapping
 _AXIS_INDEX = {'x': 0, 'y': 1, 'z': 2}

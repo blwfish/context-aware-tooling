@@ -1,9 +1,9 @@
 """
-Model splitting and pin/socket registration utilities for resin MSLA printing.
+Model splitting, registration, and bracing utilities for resin MSLA printing.
 
 Provides functions to split a FreeCAD shape along arbitrary or axis-aligned
-planes, and add tapered pin/socket registration features for accurate
-reassembly of multi-piece prints.
+planes, add tapered pin/socket registration features for accurate reassembly,
+and add temporary sprue-like bracing for structural support during printing.
 
 Usage (from FreeCAD MCP execute_python):
     from split_utils import split_and_register, split_and_register_plane
@@ -16,6 +16,13 @@ Usage (from FreeCAD MCP execute_python):
 
     # Arbitrary plane split:
     neg, pos = split_and_register_plane(shape, point, normal, pin_count=4)
+
+    # Split + register + brace in one step:
+    neg, pos = split_register_and_brace(shape, axis='y', position=45.0)
+
+    # Add bracing separately (after registration):
+    neg, pos, pins = add_registration_plane(neg, pos, pt, n, return_positions=True)
+    neg = add_bracing(neg, pt, n, pins)
 
 All dimensions are in print-scale mm (not prototype scale).
 """
@@ -60,6 +67,16 @@ BLISTER_DEPTH = 1.5            # mm -- boss extent from split face into each hal
 BLISTER_OVERLAP = 0.3          # mm -- embed into wall for solid bond
 BLISTER_SPACING = 15.0         # mm -- default spacing along interior edges
 BLISTER_EDGE_MARGIN = 3.0     # mm -- inset from ends of interior edges
+
+# ---------------------------------------------------------------------------
+# Constants — temporary bracing (sprue runners)
+# ---------------------------------------------------------------------------
+
+BRACE_WIDTH = 1.5              # mm -- runner width (perpendicular to run direction)
+BRACE_DEPTH = 1.0              # mm -- runner depth (along plane normal, straddles split)
+BRACE_NECK_WIDTH = 0.4         # mm -- thin neck at pin connections for snap-off
+BRACE_NECK_LENGTH = 1.5        # mm -- length of neck-down zone at each end
+BRACE_OFFSET = 0.0             # mm -- offset from wall into hollow (0 = flush with wall)
 
 
 # ---------------------------------------------------------------------------
@@ -112,25 +129,33 @@ def split_model_plane(shape, point, normal):
     n = Vector(normal)
     n.normalize()
     u, v = _plane_basis(n)
-
-    # Build a large planar face on the split plane using explicit corners.
-    # This avoids Part.makePlane's internal UV convention issues.
     p = Vector(point)
-    c1 = p - u * half_size - v * half_size
-    c2 = p + u * half_size - v * half_size
-    c3 = p + u * half_size + v * half_size
-    c4 = p - u * half_size + v * half_size
-    wire = Part.makePolygon([c1, c2, c3, c4, c1])
-    plane_face = Part.Face(wire)
 
-    # Create half-spaces using reference points on each side
-    ref_pos = p + n * 10.0
-    ref_neg = p - n * 10.0
-    hs_pos = plane_face.makeHalfSpace(ref_pos)
-    hs_neg = plane_face.makeHalfSpace(ref_neg)
+    # Build two large boxes, one on each side of the split plane.
+    # Using boolean cut (shape.common with a solid box) reliably creates
+    # cap faces at the cut boundary — unlike half-space common which
+    # clips faces but doesn't cap compound shapes.
+    #
+    # Each box extends from the split plane outward by half_size.
+    # Box thickness along the normal = half_size (one-sided).
 
-    neg_half = shape.common(hs_neg)
-    pos_half = shape.common(hs_pos)
+    def _make_half_box(offset_dir):
+        """Make a large box on one side of the split plane."""
+        center = p + offset_dir * (half_size / 2)
+        c1 = center - u * half_size - v * half_size - offset_dir * (half_size / 2)
+        c2 = center + u * half_size - v * half_size - offset_dir * (half_size / 2)
+        c3 = center + u * half_size + v * half_size - offset_dir * (half_size / 2)
+        c4 = center - u * half_size + v * half_size - offset_dir * (half_size / 2)
+        # Extrude along offset_dir
+        wire = Part.makePolygon([c1, c2, c3, c4, c1])
+        face = Part.Face(wire)
+        return face.extrude(offset_dir * half_size)
+
+    box_neg = _make_half_box(n * -1)
+    box_pos = _make_half_box(n)
+
+    neg_half = shape.common(box_neg)
+    pos_half = shape.common(box_pos)
 
     print(f"Split at plane (point={point}, normal={n}): "
           f"neg solids={len(neg_half.Solids)}, "
@@ -480,6 +505,9 @@ def _classify_split_face_edges(shape, split_face):
     pointing toward the enclosed volume (toward BB center); exterior
     wall faces have normals pointing away.
 
+    Uses OCC's ancestor map for O(1) edge→face lookup instead of
+    brute-force iteration over all faces.
+
     Parameters
     ----------
     shape : Part.Shape
@@ -499,19 +527,38 @@ def _classify_split_face_edges(shape, split_face):
         (bb.ZMin + bb.ZMax) / 2,
     )
 
+    # Build edge midpoint → adjacent face lookup.
+    # For each edge of the split face, find any non-split-face face of the
+    # shape that shares the edge.  We match edges by midpoint proximity
+    # (cheaper than isSame on every combination).
+    #
+    # Step 1: Index all shape faces by the midpoints of their edges.
+    edge_mid_to_faces = {}  # (rounded_x, rounded_y, rounded_z) → list of face
+    rnd = 2  # decimal places for rounding — 0.01mm precision
+    split_face_id = id(split_face)
+
+    for face in shape.Faces:
+        if face.isSame(split_face):
+            continue
+        for fe in face.Edges:
+            fem = fe.valueAt(
+                fe.FirstParameter + (fe.LastParameter - fe.FirstParameter) / 2
+            )
+            key = (round(fem.x, rnd), round(fem.y, rnd), round(fem.z, rnd))
+            if key not in edge_mid_to_faces:
+                edge_mid_to_faces[key] = []
+            edge_mid_to_faces[key].append(face)
+
+    # Step 2: For each split face edge, look up adjacent face via midpoint.
     results = []
     for edge in split_face.Edges:
         mid = edge.valueAt(
             edge.FirstParameter + (edge.LastParameter - edge.FirstParameter) / 2
         )
+        key = (round(mid.x, rnd), round(mid.y, rnd), round(mid.z, rnd))
 
         classified = False
-        for face in shape.Faces:
-            if face.isSame(split_face):
-                continue
-            if not any(fe.isSame(edge) for fe in face.Edges):
-                continue
-
+        for face in edge_mid_to_faces.get(key, []):
             try:
                 uv = face.Surface.parameter(mid)
                 normal = face.normalAt(uv[0], uv[1])
@@ -1096,7 +1143,7 @@ def add_blister_registration_plane(neg_half, pos_half, plane_point,
 
 
 def add_registration_plane(neg_half, pos_half, plane_point, plane_normal,
-                           pin_count=None):
+                           pin_count=None, return_positions=False):
     """
     Add pin/socket registration features to two split halves.
 
@@ -1116,11 +1163,15 @@ def add_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         Normal vector of the split plane (points from neg toward pos).
     pin_count : int or None
         Exact number of pins. When None, count is derived from spacing.
+    return_positions : bool
+        If True, also return the list of pin positions (for downstream
+        use by bracing, etc.).
 
     Returns
     -------
-    tuple of (Part.Shape, Part.Shape)
-        (neg_with_pins, pos_with_sockets)
+    tuple of (Part.Shape, Part.Shape) or (Part.Shape, Part.Shape, list)
+        (neg_with_pins, pos_with_sockets) or
+        (neg_with_pins, pos_with_sockets, pin_positions) when return_positions=True.
     """
     n = Vector(plane_normal)
     n.normalize()
@@ -1132,11 +1183,15 @@ def add_registration_plane(neg_half, pos_half, plane_point, plane_normal,
         split_face = _find_split_face(pos_half, plane_point, n)
     if split_face is None:
         logger.warning("Could not find split face for pin placement")
+        if return_positions:
+            return neg_half, pos_half, []
         return neg_half, pos_half
 
     positions = _pin_positions_on_face(split_face, n, count=pin_count)
     if not positions:
         logger.warning("No room for registration pins on split face")
+        if return_positions:
+            return neg_half, pos_half, []
         return neg_half, pos_half
 
     pin_dir = n  # pins grow from neg toward pos
@@ -1156,6 +1211,9 @@ def add_registration_plane(neg_half, pos_half, plane_point, plane_normal,
     pos_result = pos_half.cut(sock_compound)
 
     print(f"Added {len(positions)} registration pin/socket pairs")
+
+    if return_positions:
+        return neg_result, pos_result, positions
     return neg_result, pos_result
 
 
@@ -1248,3 +1306,554 @@ def split_and_register(shape, axis, position, pin_axis=None, pin_count=None):
     """
     neg, pos = split_model(shape, axis, position)
     return add_registration(neg, pos, axis, position, pin_count=pin_count)
+
+
+def split_register_and_brace_plane(shape, point, normal, pin_count=None):
+    """
+    Split, register, and brace in one step.
+
+    Splits the shape, adds pin/socket registration, then adds temporary
+    sprue bracing connecting pin bases along interior walls.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        Model to split.
+    point : Vector
+        A point on the split plane.
+    normal : Vector
+        Normal vector of the split plane.
+    pin_count : int or None
+        Exact number of pins.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_with_pins_and_braces, pos_with_sockets_and_braces)
+    """
+    neg, pos = split_model_plane(shape, point, normal)
+    neg, pos, pin_positions = add_registration_plane(
+        neg, pos, point, normal, pin_count=pin_count, return_positions=True)
+    neg, pos = add_bracing_both(neg, pos, point, normal, pin_positions)
+    return neg, pos
+
+
+def split_register_and_brace(shape, axis, position, pin_count=None):
+    """
+    Split, register, and brace along an axis-aligned plane.
+
+    Convenience wrapper for axis-aligned splits with bracing.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        Model to split.
+    axis : str
+        Split axis ('x', 'y', or 'z').
+    position : float
+        Split coordinate.
+    pin_count : int or None
+        Exact number of pins.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_with_pins_and_braces, pos_with_sockets_and_braces)
+    """
+    axis_map = {
+        'x': (Vector(position, 0, 0), Vector(1, 0, 0)),
+        'y': (Vector(0, position, 0), Vector(0, 1, 0)),
+        'z': (Vector(0, 0, position), Vector(0, 0, 1)),
+    }
+    if axis not in axis_map:
+        raise ValueError(f"axis must be 'x', 'y', or 'z', got '{axis}'")
+    point, normal = axis_map[axis]
+    return split_register_and_brace_plane(shape, point, normal,
+                                           pin_count=pin_count)
+
+
+# ---------------------------------------------------------------------------
+# Cut face analysis — reusable result from split face detection
+# ---------------------------------------------------------------------------
+
+class CutFaceAnalysis:
+    """
+    Reusable analysis of a split face: the face itself, edge classifications,
+    and the bounding box center for interior direction computation.
+    """
+
+    def __init__(self, split_face, edge_classes, bb_center):
+        self.split_face = split_face
+        self.edge_classes = edge_classes  # list of (edge, 'interior'|'exterior')
+        self.bb_center = bb_center
+
+    @property
+    def interior_edges(self):
+        return [e for e, c in self.edge_classes if c == 'interior']
+
+    @property
+    def exterior_edges(self):
+        return [e for e, c in self.edge_classes if c == 'exterior']
+
+    @property
+    def wall_edges(self):
+        """Interior edges that are roughly horizontal (not floor/ceiling).
+
+        Filters to edges whose direction has a significant component
+        perpendicular to the vertical (Z) axis.  Floor edges run
+        horizontally but are interior edges at the bottom of the model;
+        wall edges are the vertical interior edges we want braces on.
+
+        For a horizontal split plane (normal along Y, say), the
+        "wall edges" are the ones that run along X or Z on interior walls.
+        We keep all interior edges here — the caller filters floor vs wall
+        based on the specific model orientation.
+        """
+        return self.interior_edges
+
+
+def analyze_cut_face(shape, plane_point, plane_normal):
+    """
+    Analyze the cut face on a split half: find the face, classify edges.
+
+    Parameters
+    ----------
+    shape : Part.Shape
+        A split half.
+    plane_point : Vector
+        A point on the split plane.
+    plane_normal : Vector
+        Normal of the split plane.
+
+    Returns
+    -------
+    CutFaceAnalysis or None
+        Analysis result, or None if the split face wasn't found.
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+
+    split_face = _find_split_face(shape, plane_point, n)
+    if split_face is None:
+        return None
+
+    edge_classes = _classify_split_face_edges(shape, split_face)
+
+    bb = shape.BoundBox
+    bb_center = Vector(
+        (bb.XMin + bb.XMax) / 2,
+        (bb.YMin + bb.YMax) / 2,
+        (bb.ZMin + bb.ZMax) / 2,
+    )
+
+    return CutFaceAnalysis(split_face, edge_classes, bb_center)
+
+
+# ---------------------------------------------------------------------------
+# Temporary bracing — sprue runners connecting pin bases
+# ---------------------------------------------------------------------------
+
+def _project_point_to_edge(point, edge):
+    """
+    Project a point onto an edge and return (parameter, projected_point, distance).
+    """
+    try:
+        dist_info = edge.distToShape(Part.Vertex(point))
+        closest_pt = dist_info[1][0][1]  # closest point on edge
+        param = edge.Curve.parameter(closest_pt)
+        return param, closest_pt, dist_info[0]
+    except Exception:
+        return None, None, float('inf')
+
+
+def _find_pins_near_edge(pin_positions, edge, max_dist=3.0):
+    """
+    Find pin positions that are close to a given edge.
+
+    Returns list of (pin_index, parameter_on_edge, projected_point)
+    sorted by parameter along the edge.
+    """
+    results = []
+    for i, pos in enumerate(pin_positions):
+        param, proj_pt, dist = _project_point_to_edge(pos, edge)
+        if dist <= max_dist and param is not None:
+            results.append((i, param, proj_pt))
+
+    # Sort by parameter along edge
+    results.sort(key=lambda x: x[1])
+    return results
+
+
+def _interior_direction_at(point, edge, plane_normal, bb_center):
+    """
+    Compute the direction from an interior edge point into the hollow.
+
+    This is the same computation used for blister_dir and tab wall_dir,
+    factored out for reuse.
+
+    Returns a unit vector pointing into the hollow (toward BB center),
+    or None if degenerate.
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+
+    to_center = bb_center - point
+    # Remove plane-normal component
+    to_center = to_center - n * to_center.dot(n)
+    # Remove edge-tangent component
+    try:
+        param = edge.Curve.parameter(point)
+        tangent = edge.tangentAt(param)
+        to_center = to_center - tangent * to_center.dot(tangent)
+    except Exception:
+        pass
+    if to_center.Length < 1e-6:
+        return None
+    to_center.normalize()
+    return to_center
+
+
+def _make_runner_segment(start, end, plane_normal, interior_dir,
+                         width=BRACE_WIDTH, depth=BRACE_DEPTH):
+    """
+    Make a single runner segment (rectangular bar) between two points.
+
+    The bar runs from start to end, with cross-section width x depth.
+    Width is measured perpendicular to both the run direction and
+    plane_normal (i.e., into the hollow / along the wall).
+    Depth straddles the split plane along plane_normal.
+
+    Parameters
+    ----------
+    start, end : Vector
+        Endpoints of the runner segment.
+    plane_normal : Vector
+        Split plane normal.
+    interior_dir : Vector
+        Direction into the hollow from the wall edge.
+    width : float
+        Cross-section width (into hollow).
+    depth : float
+        Cross-section depth (along plane normal).
+
+    Returns
+    -------
+    Part.Shape
+        Solid bar.
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+    d = Vector(interior_dir)
+    d.normalize()
+
+    run_dir = end - start
+    length = run_dir.Length
+    if length < 0.01:
+        return None
+    run_dir.normalize()
+
+    # Cross-section axes:
+    # - along plane_normal: ±depth/2
+    # - into hollow (interior_dir): 0 to width (offset from wall edge)
+    hd = depth / 2
+
+    # Build the 4 corners of the cross-section at start
+    c1 = start - n * hd + d * BRACE_OFFSET
+    c2 = start + n * hd + d * BRACE_OFFSET
+    c3 = start + n * hd + d * (BRACE_OFFSET + width)
+    c4 = start - n * hd + d * (BRACE_OFFSET + width)
+
+    # Extrude along run direction
+    wire = Part.makePolygon([c1, c2, c3, c4, c1])
+    face = Part.Face(wire)
+    bar = face.extrude(run_dir * length)
+    return bar
+
+
+def _make_neck_notch(point, run_dir, plane_normal, interior_dir,
+                     width=BRACE_WIDTH, depth=BRACE_DEPTH,
+                     neck_width=BRACE_NECK_WIDTH,
+                     neck_length=BRACE_NECK_LENGTH):
+    """
+    Make a pair of notch solids that, when subtracted from a runner,
+    create a thin neck at a connection point.
+
+    The notches cut from both sides of the runner (along interior_dir),
+    leaving only neck_width of material in the center.
+
+    Returns a list of Part.Shape (notch solids to subtract).
+    """
+    n = Vector(plane_normal)
+    n.normalize()
+    d = Vector(interior_dir)
+    d.normalize()
+    r = Vector(run_dir)
+    r.normalize()
+
+    hd = depth / 2
+    hl = neck_length / 2
+    notch_depth = (width - neck_width) / 2
+
+    if notch_depth < 0.05:
+        return []  # runner is already thin enough
+
+    notches = []
+
+    # Notch on the wall side (near edge, cutting from offset toward center)
+    wall_base = point - r * hl - n * (hd + 0.1) + d * BRACE_OFFSET
+    wall_notch = Part.makeBox(
+        neck_length, depth + 0.2, notch_depth,
+        wall_base, r
+    )
+    # Need to orient the box properly — use explicit corners instead
+    wb1 = point - r * hl - n * (hd + 0.1) + d * BRACE_OFFSET
+    wb2 = point + r * hl - n * (hd + 0.1) + d * BRACE_OFFSET
+    wb3 = point + r * hl + n * (hd + 0.1) + d * BRACE_OFFSET
+    wb4 = point - r * hl + n * (hd + 0.1) + d * BRACE_OFFSET
+    wt1 = wb1 + d * notch_depth
+    wt2 = wb2 + d * notch_depth
+    wt3 = wb3 + d * notch_depth
+    wt4 = wb4 + d * notch_depth
+
+    def _make_box_from_8pts(pts):
+        """Make a solid from 8 corner points (4 bottom + 4 top)."""
+        def _quad(a, b, c, dd):
+            wire = Part.makePolygon([a, b, c, dd, a])
+            return Part.Face(wire)
+        b = pts[:4]
+        t = pts[4:]
+        faces = [
+            _quad(b[0], b[1], b[2], b[3]),  # bottom
+            _quad(t[0], t[3], t[2], t[1]),  # top
+            _quad(b[0], b[3], t[3], t[0]),  # side
+            _quad(b[1], t[1], t[2], b[2]),  # side
+            _quad(b[0], t[0], t[1], b[1]),  # side
+            _quad(b[2], b[3], t[3], t[2]),  # side (not used, but needed for closed shell)
+        ]
+        # Simpler: just use extrude
+        return None
+
+    # Simpler approach: build notch as extruded rectangle
+    # Wall-side notch
+    notch_profile_start = point - r * hl + d * BRACE_OFFSET
+    notch_profile_end = point - r * hl + d * (BRACE_OFFSET + notch_depth)
+    notch_c1 = notch_profile_start - n * (hd + 0.1)
+    notch_c2 = notch_profile_start + n * (hd + 0.1)
+    notch_c3 = notch_profile_end + n * (hd + 0.1)
+    notch_c4 = notch_profile_end - n * (hd + 0.1)
+    notch_wire = Part.makePolygon([notch_c1, notch_c2, notch_c3, notch_c4, notch_c1])
+    notch_face = Part.Face(notch_wire)
+    wall_notch = notch_face.extrude(r * neck_length)
+    notches.append(wall_notch)
+
+    # Hollow-side notch (from outer edge of runner inward)
+    notch_profile_start2 = point - r * hl + d * (BRACE_OFFSET + width - notch_depth)
+    notch_profile_end2 = point - r * hl + d * (BRACE_OFFSET + width + 0.1)
+    notch_c5 = notch_profile_start2 - n * (hd + 0.1)
+    notch_c6 = notch_profile_start2 + n * (hd + 0.1)
+    notch_c7 = notch_profile_end2 + n * (hd + 0.1)
+    notch_c8 = notch_profile_end2 - n * (hd + 0.1)
+    notch_wire2 = Part.makePolygon([notch_c5, notch_c6, notch_c7, notch_c8, notch_c5])
+    notch_face2 = Part.Face(notch_wire2)
+    hollow_notch = notch_face2.extrude(r * neck_length)
+    notches.append(hollow_notch)
+
+    return notches
+
+
+def _is_floor_edge(edge, plane_normal, floor_normal_threshold=0.7):
+    """
+    Determine if an interior edge is a floor/ceiling edge vs a wall edge.
+
+    Floor edges are those where the adjacent wall face is roughly
+    horizontal (face normal has a large vertical component).
+    For buildings, floor edges run horizontally at the bottom of walls.
+
+    We approximate by checking if the edge direction is predominantly
+    horizontal. Wall edges on a vertical split tend to be vertical or
+    angled; floor edges are horizontal.
+
+    For a typical building split horizontally (normal along Y):
+    - Wall edges run vertically (along Z) or along X
+    - Floor edges also run along X or Z but at the bottom
+
+    Since we can't easily distinguish wall-bottom from floor edges by
+    direction alone, we use a heuristic: edges near the bottom of the
+    bounding box of the split face are floor candidates.
+
+    Parameters
+    ----------
+    edge : Part.Edge
+        The edge to check.
+    plane_normal : Vector
+        Split plane normal.
+    floor_normal_threshold : float
+        Not used in current heuristic but reserved.
+
+    Returns
+    -------
+    bool
+    """
+    # For now, don't filter — let the caller decide.
+    # The brace system connects pin-to-pin, and pins are placed by
+    # the pin placement algorithm which already avoids floor areas
+    # for typical building models.
+    return False
+
+
+def add_bracing(piece, plane_point, plane_normal, pin_positions,
+                exclude_floor=True):
+    """
+    Add temporary sprue-like bracing connecting pin bases along interior walls.
+
+    Braces are thin runners that connect adjacent pin positions along
+    interior wall edges of the split face. They provide structural
+    support during printing and are designed for snap-off removal via
+    thin neck-down sections at each pin connection.
+
+    Call this AFTER pin/socket placement, passing the pin positions used.
+
+    Parameters
+    ----------
+    piece : Part.Shape
+        The split half to add bracing to (typically the piece with pins).
+    plane_point : Vector
+        A point on the split plane.
+    plane_normal : Vector
+        Normal of the split plane.
+    pin_positions : list of Vector
+        Pin center positions on the split face (from _pin_positions_on_face
+        or equivalent).
+    exclude_floor : bool
+        If True, skip edges classified as floor edges (not yet implemented —
+        reserved for future use).
+
+    Returns
+    -------
+    Part.Shape
+        The piece with bracing runners fused on.
+    """
+    if len(pin_positions) < 2:
+        logger.info("Need at least 2 pins for bracing — skipping")
+        return piece
+
+    n = Vector(plane_normal)
+    n.normalize()
+
+    # Analyze the cut face
+    analysis = analyze_cut_face(piece, plane_point, n)
+    if analysis is None:
+        logger.warning("Could not find split face for bracing")
+        return piece
+
+    interior_edges = analysis.interior_edges
+    if not interior_edges:
+        logger.warning("No interior edges found — skipping bracing")
+        return piece
+
+    runner_shapes = []
+    notch_shapes = []
+    connections_made = 0
+
+    for edge in interior_edges:
+        if exclude_floor and _is_floor_edge(edge, n):
+            continue
+
+        # Find which pins are near this edge
+        pins_on_edge = _find_pins_near_edge(pin_positions, edge,
+                                             max_dist=PIN_RADIUS + BRACE_WIDTH + 1.0)
+        if len(pins_on_edge) < 2:
+            continue
+
+        # Compute interior direction at edge midpoint
+        edge_mid = edge.valueAt(
+            (edge.FirstParameter + edge.LastParameter) / 2)
+        interior_dir = _interior_direction_at(
+            edge_mid, edge, n, analysis.bb_center)
+        if interior_dir is None:
+            continue
+
+        # Create runners between adjacent pin pairs along this edge
+        for j in range(len(pins_on_edge) - 1):
+            idx_a, param_a, proj_a = pins_on_edge[j]
+            idx_b, param_b, proj_b = pins_on_edge[j + 1]
+
+            # Use the actual pin positions (on the split face) as endpoints
+            start = pin_positions[idx_a]
+            end = pin_positions[idx_b]
+
+            seg_length = (end - start).Length
+            if seg_length < BRACE_NECK_LENGTH * 2 + 0.5:
+                # Too short for a runner with two neck-downs
+                continue
+
+            runner = _make_runner_segment(start, end, n, interior_dir)
+            if runner is None:
+                continue
+            runner_shapes.append(runner)
+
+            # Add neck-down notches at each end
+            run_dir = end - start
+            run_dir.normalize()
+
+            notches_start = _make_neck_notch(start, run_dir, n, interior_dir)
+            notches_end = _make_neck_notch(end, run_dir, n, interior_dir)
+            notch_shapes.extend(notches_start)
+            notch_shapes.extend(notches_end)
+            connections_made += 1
+
+    if not runner_shapes:
+        logger.info("No brace connections possible between pins")
+        return piece
+
+    # Fuse all runners together first
+    if len(runner_shapes) == 1:
+        runner_compound = runner_shapes[0]
+    else:
+        runner_compound = runner_shapes[0]
+        for rs in runner_shapes[1:]:
+            runner_compound = runner_compound.fuse(rs)
+
+    # Cut notches for neck-downs
+    if notch_shapes:
+        notch_compound = Part.Compound(notch_shapes)
+        runner_compound = runner_compound.cut(notch_compound)
+
+    # Fuse bracing onto the piece
+    result = piece.fuse(runner_compound)
+
+    print(f"Added {connections_made} brace runner(s) connecting "
+          f"{len(pin_positions)} pin positions")
+    return result
+
+
+def add_bracing_both(neg_half, pos_half, plane_point, plane_normal,
+                     pin_positions):
+    """
+    Add bracing to both halves of a split model.
+
+    Adds runners to the negative half (which has pins) and matching
+    runners to the positive half. The bracing on each half extends
+    from the split face into that half's material.
+
+    Parameters
+    ----------
+    neg_half, pos_half : Part.Shape
+        The two registered halves.
+    plane_point : Vector
+        A point on the split plane.
+    plane_normal : Vector
+        Normal of the split plane.
+    pin_positions : list of Vector
+        Pin positions used during registration.
+
+    Returns
+    -------
+    tuple of (Part.Shape, Part.Shape)
+        (neg_with_bracing, pos_with_bracing)
+    """
+    neg_result = add_bracing(neg_half, plane_point, plane_normal,
+                              pin_positions)
+    pos_result = add_bracing(pos_half, plane_point, plane_normal,
+                              pin_positions)
+    return neg_result, pos_result

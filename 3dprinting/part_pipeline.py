@@ -188,6 +188,34 @@ def _point_in_triangle_xy(px, py, p0, p1, p2):
     return a >= -1e-9 and b >= -1e-9 and c >= -1e-9
 
 
+def _convex_hull_2d(points):
+    """Andrew's monotone chain — compute 2D convex hull of a list of
+    (x, y) tuples.  Returns hull vertices in counter-clockwise order,
+    without repeating the start point.  Handles collinear points by
+    excluding interior-colinear ones (strict turn check).
+    """
+    if len(points) < 2:
+        return list(points)
+    pts = sorted(set(points))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
 def _interpolate_z_on_triangle(px, py, p0, p1, p2):
     """Barycentric Z interpolation for a point inside the triangle's XY projection."""
     x0, y0, z0 = p0[0], p0[1], p0[2]
@@ -267,25 +295,50 @@ def rasterize_facets_to_contacts(down_facets, mesh_world, grid_spacing=4.0):
             continue
         cells[(gx, gy)] = (c.x, c.y, c.z, n)
 
-    # Pass 3: extremal-point guard.  The absolute lowest vertex of any
-    # downward facet is the magic-island hot spot — the first layer
-    # lands there.  Even with rasterization, the true corner can sit
-    # BETWEEN grid cell centers and never get a support.  Walk every
-    # downward facet vertex, find the minimum-Z one, and place a
-    # support directly under it if no existing contact is close enough.
-    low_x, low_y, low_z, low_n = None, None, float('inf'), None
+    # Pass 3: extremal-point guards.  Supports on the PERIMETER of the
+    # downward region matter most — that's where each layer's peel
+    # front starts and ends, and where resin shrinkage tugs corners
+    # inward.  We approximate "perimeter corners" with the 2D convex
+    # hull of all downward-facet vertices, and ensure a support sits
+    # within grid_spacing of every hull vertex.
+    #
+    # For a rectangle: 4 hull vertices → the 4 projected corners.
+    # For a hexagon: 6 hull vertices.
+    # For a round part: many hull vertices (one per mesh vertex on the
+    # perimeter), but most will already have a grid contact nearby so
+    # the near-neighbor check filters them out — only actual "gaps"
+    # between grid contacts and the true boundary get extra supports.
+    # Also explicitly include the lowest-Z vertex (magic-island
+    # hot-spot), which may not be on the XY convex hull.
+    near_r2 = grid_spacing * grid_spacing
+
+    # Gather unique down-facet vertices, keeping lowest Z per (x, y)
+    # and a representative normal.
+    vertex_map = {}
+    low_key = None
+    low_z = float('inf')
     for idx, _, n, _ in down_facets:
         pts = facets[idx].Points
         for p in pts:
+            key = (round(p[0], 3), round(p[1], 3))
+            existing = vertex_map.get(key)
+            if existing is None or p[2] < existing[2]:
+                vertex_map[key] = (p[0], p[1], p[2], n)
             if p[2] < low_z:
-                low_x, low_y, low_z, low_n = p[0], p[1], p[2], n
-    if low_n is not None:
-        # Is any existing contact within grid_spacing of the low point?
-        near_r2 = grid_spacing * grid_spacing
-        has_neighbor = any((x - low_x) ** 2 + (y - low_y) ** 2 < near_r2
+                low_z = p[2]
+                low_key = key
+
+    # 2D convex hull via Andrew's monotone chain
+    hull_keys = _convex_hull_2d(list(vertex_map.keys()))
+    if low_key is not None and low_key not in hull_keys:
+        hull_keys.append(low_key)
+
+    for key in hull_keys:
+        bx, by, bz, bn = vertex_map[key]
+        has_neighbor = any((x - bx) ** 2 + (y - by) ** 2 < near_r2
                            for (x, y, _, _) in cells.values())
         if not has_neighbor:
-            cells[("extremum", "low")] = (low_x, low_y, low_z, low_n)
+            cells[("extremum", key)] = (bx, by, bz, bn)
 
     return [Contact(x=x, y=y, z=z, nx=n.x, ny=n.y, nz=n.z, base_z=0.0)
             for (x, y, z, n) in cells.values()]

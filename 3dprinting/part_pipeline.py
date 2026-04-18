@@ -43,6 +43,7 @@ from orientation import (
 from support_utils import (
     Contact, build_tapered_support, build_raft, MODEL_RAISE,
     TIP_RADIUS, COLUMN_RADIUS, BASE_PAD_RADIUS, BASE_PAD_HEIGHT,
+    NECK_HEIGHT,
 )
 
 logger = logging.getLogger(__name__)
@@ -341,15 +342,25 @@ def rasterize_facets_to_contacts(down_facets, mesh_world, grid_spacing=4.0):
             cells[("extremum", key)] = (bx, by, bz, bn)
 
     # Steer each support's neck toward the centroid of the contact set
-    # in XY.  For a rim contact, this aims the neck-to-tip approach
-    # INWARD (through the mating-face interior, i.e. open air) so the
-    # tapered neck doesn't scrape adjacent visible detail.  The face
-    # normal is preserved — only the column's XY offset changes.
+    # in XY — but check for COLLISIONS between the column and the model
+    # first.  The default centroid-direction neck offset puts the column
+    # inside the part's bounding region; for a hollow part (bay window,
+    # building shell), that column path can pass through an interior
+    # wall or window divider.
+    #
+    # For each contact, we test 8 candidate directions (the centroid
+    # direction plus 7 rotations of it by 45°) and pick the first one
+    # whose column (a vertical line at the offset XY) is clear of any
+    # part geometry below the tip Z.  Falls back to centroid if none
+    # work.
     if len(cells) >= 2:
         cx_mean = sum(v[0] for v in cells.values()) / len(cells)
         cy_mean = sum(v[1] for v in cells.values()) / len(cells)
     else:
         cx_mean = cy_mean = 0.0
+
+    # Pre-index facets by XY bbox for cheaper collision tests.
+    facet_data = _build_facet_xy_index(mesh_world)
 
     contacts = []
     for (x, y, z, n) in cells.values():
@@ -357,13 +368,80 @@ def rasterize_facets_to_contacts(down_facets, mesh_world, grid_spacing=4.0):
         dy = cy_mean - y
         d = math.sqrt(dx * dx + dy * dy)
         if d > 1e-6:
-            ntx, nty = dx / d, dy / d
+            cx_dir = dx / d
+            cy_dir = dy / d
         else:
-            ntx = nty = 0.0  # contact sits AT centroid, no steering needed
+            cx_dir = cy_dir = 0.0
+
+        chosen = _find_clear_neck_direction(
+            x, y, z, cx_dir, cy_dir, facet_data,
+            raft_top_z=0.0, neck_offset=NECK_HEIGHT,
+        )
         contacts.append(Contact(x=x, y=y, z=z,
                                 nx=n.x, ny=n.y, nz=n.z, base_z=0.0,
-                                neck_toward_x=ntx, neck_toward_y=nty))
+                                neck_toward_x=chosen[0],
+                                neck_toward_y=chosen[1]))
     return contacts
+
+
+def _build_facet_xy_index(mesh_world):
+    """Return a list of (x0,y0,z0, x1,y1,z1, x2,y2,z2, xmin,xmax,ymin,ymax,zmin,zmax)
+    tuples for each facet.  Used to cheaply reject facets that can't contain
+    a given (col_x, col_y) test point."""
+    data = []
+    for f in mesh_world.Facets:
+        pts = f.Points
+        p0, p1, p2 = pts[0], pts[1], pts[2]
+        x_min = min(p0[0], p1[0], p2[0])
+        x_max = max(p0[0], p1[0], p2[0])
+        y_min = min(p0[1], p1[1], p2[1])
+        y_max = max(p0[1], p1[1], p2[1])
+        z_min = min(p0[2], p1[2], p2[2])
+        z_max = max(p0[2], p1[2], p2[2])
+        data.append((p0, p1, p2, x_min, x_max, y_min, y_max, z_min, z_max))
+    return data
+
+
+def _column_collides(col_x, col_y, raft_top_z, tip_z, facet_data,
+                     clearance=0.5):
+    """Return True if a vertical line at (col_x, col_y) passes through any
+    facet at Z strictly between raft_top_z and (tip_z - clearance)."""
+    tip_z_safe = tip_z - clearance
+    for (p0, p1, p2, x_min, x_max, y_min, y_max, z_min, z_max) in facet_data:
+        if z_max <= raft_top_z + 0.01 or z_min >= tip_z_safe:
+            continue
+        if col_x < x_min or col_x > x_max or col_y < y_min or col_y > y_max:
+            continue
+        if _point_in_triangle_xy(col_x, col_y, p0, p1, p2):
+            return True
+    return False
+
+
+def _find_clear_neck_direction(tip_x, tip_y, tip_z, cx_dir, cy_dir,
+                               facet_data, raft_top_z, neck_offset):
+    """Return a (ntx, nty) unit direction such that a column offset by
+    neck_offset*(ntx, nty) from the tip clears the part geometry.
+    Prefers directions closest to the centroid direction (cx_dir, cy_dir)."""
+    # 8 candidate directions: centroid + rotations by 45°.  The rotations
+    # cover all cardinal+diagonal offsets so at least one usually clears.
+    import math as _m
+    if cx_dir == 0.0 and cy_dir == 0.0:
+        return (0.0, 0.0)
+
+    base_angle = _m.atan2(cy_dir, cx_dir)
+    # Preference order: centroid direction first, then alternating ±45°, ±90°, ±135°, 180°
+    offsets_deg = [0, -45, 45, -90, 90, -135, 135, 180]
+    for off in offsets_deg:
+        a = base_angle + _m.radians(off)
+        dx = _m.cos(a)
+        dy = _m.sin(a)
+        col_x = tip_x + neck_offset * dx
+        col_y = tip_y + neck_offset * dy
+        if not _column_collides(col_x, col_y, raft_top_z, tip_z, facet_data):
+            return (dx, dy)
+    # Nothing clear — return centroid direction and let it collide
+    # (the alternative would be no support at all, which is worse).
+    return (cx_dir, cy_dir)
 
 
 # Legacy name — kept as an alias in case any caller refers to the old

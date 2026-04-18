@@ -225,7 +225,7 @@ def generate_candidates(include_tilts=True):
         # wedge per layer.  X covers 10-30°, Y adds a milder secondary
         # tilt of 0-10°.
         x_tilts = (10, 18, 25, 30)
-        y_tilts = (0, 10)
+        y_tilts = (0, 5, 10)
         base = _rot((0, 0, 1), 0)          # identity
         base_flip = _rot((1, 0, 0), 180)   # upside-down
         for base_name, base_rot in (("part-Zdown", base),

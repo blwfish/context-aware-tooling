@@ -84,12 +84,17 @@ PEEL_Z_BIN_MM = 1.0
 # so they can only contact surfaces that face downward.  When the non-display
 # direction points toward the plate (-Z world), supports hit non-display
 # cleanly.  When it points sideways or upward, supports are forced onto the
-# display side — a much worse outcome than numbers alone suggest, because
-# the cosmetic cost is hidden in tiny per-facet contributions.  Penalty
-# is proportional to (1 + non_display_world.z), ranging 0 (ideal, -Z) to 2
-# (worst, +Z).  The weight is set high enough to break ties between
-# sideways and upright orientations in favor of upright.
-NON_DISPLAY_NOT_DOWN_WEIGHT = 2000.0
+# display side.  Penalty is proportional to (1 + non_display_world.z),
+# ranging 0 (ideal, -Z) to 2 (worst, +Z).
+#
+# This is a PROXY for "supports will land on display geometry" — the direct
+# measurement lives in DISPLAY_DOWN_WEIGHT * display_down_area.  When the two
+# agree, this acts as a useful tiebreaker.  When they disagree, the direct
+# measurement should win: a mild tilt that keeps display_down_area at 0
+# should be allowed even if it rotates nd slightly off -Z.  Earlier values
+# (2000.0) over-weighted this proxy and blocked all mild tilts, forcing
+# print orientations with worse peel force and more magic-island risk.
+NON_DISPLAY_NOT_DOWN_WEIGHT = 200.0
 
 # Classification thresholds
 DOWNWARD_NZ_THRESHOLD = -0.2        # normal.z below this = downward-facing at all

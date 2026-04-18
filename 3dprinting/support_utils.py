@@ -115,6 +115,14 @@ RAFT_MARGIN = 2.0              # mm beyond footprint
 RAFT_THICKNESS = 1.5           # mm
 RAFT_CHAMFER = 0.4             # mm
 
+# Swiss-cheese holes — reduce material and peel force through the raft.
+# A regular grid of circular holes, skipped where they'd overlap a
+# support base pad or come too close to the raft perimeter.
+RAFT_HOLE_RADIUS = 2.0         # mm (4mm-diameter holes)
+RAFT_HOLE_SPACING = 8.0        # mm between hole centers, square grid
+RAFT_HOLE_PERIMETER_MARGIN = 2.5   # mm keep-solid from raft edge
+RAFT_HOLE_SUPPORT_CLEARANCE = 1.0  # mm keep-solid around each base pad
+
 MODEL_RAISE = 5.0              # mm to raise model off raft (minimum
                                 # support height; shorter supports are
                                 # hard to clip cleanly without marring
@@ -900,42 +908,118 @@ def build_raft(shape, contacts=None, margin=RAFT_MARGIN,
                 (bb.XMax + margin, bb.YMax + margin),
                 (bb.XMin - margin, bb.YMax + margin)]
 
-    # Build a Face from the hull polygon, offset outward by `margin`,
-    # then extrude to thickness.
+    # Build a Face from the hull polygon, offset outward by `margin`.
     hull_pts = [Vector(x, y, -thickness) for (x, y) in hull]
     hull_pts.append(hull_pts[0])   # close
-    wire = Part.makePolygon(hull_pts)
-    face = Part.Face(wire)
+    outer_wire = Part.makePolygon(hull_pts)
+    face = Part.Face(outer_wire)
     if margin > 0:
         try:
             face = face.makeOffset2D(margin, join=0, fill=False)
         except Exception as e:
             logger.warning("Raft polygon offset failed (%s); using un-offset hull", e)
 
+    # Swiss-cheese holes: compute positions, then rebuild the face with
+    # those holes as inner wires (no boolean cut needed — the extrude
+    # produces a solid with tunnels).
+    hole_centers = _raft_hole_grid(face, contacts,
+                                   hole_radius=RAFT_HOLE_RADIUS,
+                                   spacing=RAFT_HOLE_SPACING,
+                                   perimeter_margin=RAFT_HOLE_PERIMETER_MARGIN,
+                                   support_clearance=RAFT_HOLE_SUPPORT_CLEARANCE)
+    if hole_centers:
+        # Extract the offset face's outer wire — after makeOffset2D the
+        # wire may have arc edges at corners (join=0).  Use face.Wires[0]
+        # as the canonical outer boundary.
+        offset_outer = face.OuterWire if hasattr(face, 'OuterWire') else face.Wires[0]
+        inner_wires = []
+        for (hx, hy) in hole_centers:
+            circ = Part.Circle(Vector(hx, hy, -thickness), Vector(0, 0, 1),
+                               RAFT_HOLE_RADIUS)
+            w = Part.Wire([circ.toShape()])
+            # Inner (hole) wires must be CW when the outer is CCW.
+            # makeCircle gives a CCW wire, so reverse.
+            w.reverse()
+            inner_wires.append(w)
+        try:
+            face = Part.Face([offset_outer] + inner_wires)
+        except Exception as e:
+            logger.warning("Raft face-with-holes failed (%s); falling back to solid face", e)
+            hole_centers = []
+
     raft = face.extrude(Vector(0, 0, thickness))
 
-    # Chamfer only if hull ended up as a 4-edge rectangle (the simple case).
-    # Chamfering an arbitrary polygon's bottom edges is brittle.
-    if chamfer > 0 and len(raft.Edges) == 12:   # 4 bottom + 4 top + 4 vertical
+    # Chamfer the bottom outer edges so the raft has an angled foot —
+    # slides a spatula/pry-tool under the raft to lift it off the build
+    # plate.  Work on whatever polygon shape we ended up with.  The hole
+    # rim bottoms also get chamfered; that's harmless (like countersinks).
+    if chamfer > 0:
         bottom_edges = [e for e in raft.Edges
                         if (abs(e.BoundBox.ZMin + thickness) < 0.01 and
                             abs(e.BoundBox.ZMax + thickness) < 0.01)]
         if bottom_edges:
             try:
-                raft = raft.makeChamfer(chamfer, chamfer, bottom_edges)
+                raft = raft.makeChamfer(chamfer, bottom_edges)
             except Exception as e:
                 logger.warning("Raft chamfer failed: %s", e)
 
     bb_raft = raft.BoundBox
-    # Approximate area as polygon area from face
     try:
-        area = face.Area
+        area = face.Area - len(hole_centers) * math.pi * RAFT_HOLE_RADIUS ** 2
     except Exception:
         area = bb_raft.XLength * bb_raft.YLength
-    print(f"Raft: hull polygon, area {area:.0f} mm^2, "
+    print(f"Raft: hull polygon, {len(hole_centers)} drain holes, "
+          f"solid area {area:.0f} mm^2, "
           f"bbox {bb_raft.XLength:.1f} x {bb_raft.YLength:.1f} x {thickness} "
           f"at Z=[{-thickness:.1f}, 0]")
     return raft
+
+
+def _raft_hole_grid(face, contacts, hole_radius, spacing,
+                    perimeter_margin, support_clearance):
+    """Return a list of (x, y) centers for raft holes.
+
+    Holes are placed on a square grid inside `face`, excluding any cell
+    that:
+      - Is within `perimeter_margin + hole_radius` of the face boundary
+        (checked by offsetting the face inward).
+      - Comes within (BASE_PAD_RADIUS + hole_radius + support_clearance)
+        of any support's XY position.
+    """
+    try:
+        safe = face.makeOffset2D(-(perimeter_margin + hole_radius),
+                                  join=0, fill=False)
+    except Exception:
+        return []   # face too small to inset safely
+    bb = safe.BoundBox
+    if bb.XLength <= 0 or bb.YLength <= 0:
+        return []
+
+    support_xy = [(c.x, c.y) for c in (contacts or [])]
+    min_support_d2 = (BASE_PAD_RADIUS + hole_radius + support_clearance) ** 2
+
+    centers = []
+    # Offset grid by half-spacing so it's centered in the bbox.
+    x0 = bb.XMin + spacing * 0.5
+    y0 = bb.YMin + spacing * 0.5
+    nx = int(bb.XLength // spacing) + 1
+    ny = int(bb.YLength // spacing) + 1
+    for i in range(nx):
+        for j in range(ny):
+            x = x0 + i * spacing
+            y = y0 + j * spacing
+            pt = Vector(x, y, safe.BoundBox.ZMin)
+            if not safe.isInside(pt, 1e-3, True):
+                continue
+            # Clear of every support?
+            clear = True
+            for sx, sy in support_xy:
+                if (x - sx) ** 2 + (y - sy) ** 2 < min_support_d2:
+                    clear = False
+                    break
+            if clear:
+                centers.append((x, y))
+    return centers
 
 
 def raise_model(shape, amount=MODEL_RAISE):

@@ -392,6 +392,111 @@ def classify_facet_visibility(mesh, display_dir_part,
     return visible
 
 
+def compute_display_clearance(mesh, display_dir_part,
+                              grid=VISIBILITY_GRID_MM):
+    """For each facet, distance from it to the nearest display-visible
+    surface along the display direction (at the same XY projection).
+
+    Used to reject supports that would land on features just barely
+    behind a visible detail — e.g., a shingle step-underside is only
+    the shingle-thickness (~0.7 mm) below the shingle's top face.
+    Placing a support tip there is indistinguishable from placing it
+    ON the visible shingle edge, and removal leaves marks.  A true
+    mating rim on the underside is much deeper (~shell thickness, 2+ mm),
+    so a threshold of ~1 mm cleanly separates them.
+
+    Interpretation of the return value:
+      - Large positive = facet is deep below the display surface at
+        that XY; safe to support.
+      - Small positive = facet is just barely below a visible feature;
+        NOT safe (support tip mars the feature).
+      - float('inf') = no display-visible surface is above this facet
+        at all; safe (outside the hull of visible geometry).
+
+    Works for axis-aligned display directions (±X, ±Y, ±Z); returns
+    all-inf for oblique directions (caller should then skip the
+    filter).
+
+    Returns
+    -------
+    list[float] of length mesh.CountFacets
+    """
+    dx, dy, dz = display_dir_part
+
+    if abs(dz) > 0.99:
+        u_idx, v_idx, d_idx = 0, 1, 2
+        d_sign = 1.0 if dz > 0 else -1.0
+    elif abs(dy) > 0.99:
+        u_idx, v_idx, d_idx = 0, 2, 1
+        d_sign = 1.0 if dy > 0 else -1.0
+    elif abs(dx) > 0.99:
+        u_idx, v_idx, d_idx = 1, 2, 0
+        d_sign = 1.0 if dx > 0 else -1.0
+    else:
+        return [float('inf')] * mesh.CountFacets
+
+    points, faces = mesh.Topology
+    pts_tup = [(p.x, p.y, p.z) for p in points]
+    n = len(faces)
+
+    # Pass 1: compute centroids; mark front-faces (= display-visible
+    # candidates).  A front-face has its normal pointing TOWARDS the
+    # display direction.
+    front = [False] * n
+    centroids = [None] * n
+    for i in range(n):
+        a, b, c = faces[i]
+        p0 = pts_tup[a]; p1 = pts_tup[b]; p2 = pts_tup[c]
+        e1x = p1[0] - p0[0]; e1y = p1[1] - p0[1]; e1z = p1[2] - p0[2]
+        e2x = p2[0] - p0[0]; e2y = p2[1] - p0[1]; e2z = p2[2] - p0[2]
+        nvx = e1y * e2z - e1z * e2y
+        nvy = e1z * e2x - e1x * e2z
+        nvz = e1x * e2y - e1y * e2x
+        L2 = nvx*nvx + nvy*nvy + nvz*nvz
+        if L2 < 1e-24:
+            continue
+        dot = (nvx * dx + nvy * dy + nvz * dz) / (L2 ** 0.5)
+        cu = (p0[u_idx] + p1[u_idx] + p2[u_idx]) / 3.0
+        cv = (p0[v_idx] + p1[v_idx] + p2[v_idx]) / 3.0
+        cd = (p0[d_idx] + p1[d_idx] + p2[d_idx]) / 3.0 * d_sign
+        centroids[i] = (cu, cv, cd)
+        if dot > BACK_FACE_THRESHOLD:
+            front[i] = True
+
+    # Pass 2: max display-direction depth per cell, front-faces only.
+    max_depth = {}
+    for i in range(n):
+        if not front[i] or centroids[i] is None:
+            continue
+        cu, cv, cd = centroids[i]
+        gu = int(cu // grid); gv = int(cv // grid)
+        key = (gu, gv)
+        prev = max_depth.get(key)
+        if prev is None or cd > prev:
+            max_depth[key] = cd
+
+    # Pass 3: per-facet clearance = (display surface depth at this cell)
+    # minus (this facet's depth).  Positive = below display; inf if no
+    # display face exists above this XY.
+    clearance = [float('inf')] * n
+    for i in range(n):
+        if centroids[i] is None:
+            continue
+        cu, cv, cd = centroids[i]
+        gu = int(cu // grid); gv = int(cv // grid)
+        best = None
+        for ddu in (-1, 0, 1):
+            for ddv in (-1, 0, 1):
+                b = max_depth.get((gu + ddu, gv + ddv))
+                if b is not None and (best is None or b > best):
+                    best = b
+        if best is None:
+            clearance[i] = float('inf')
+        else:
+            clearance[i] = best - cd
+    return clearance
+
+
 def compute_non_display_threshold(mesh, non_display_dir, band_mm=None,
                                   band_fraction=None):
     """Return (threshold, max_proj) for non-display region in the PART frame.

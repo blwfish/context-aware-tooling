@@ -39,6 +39,7 @@ from orientation import (
     generate_candidates, pick_best_orientation, apply_rotation_to_mesh,
     _mesh_facet_normal_area, DOWNWARD_NZ_THRESHOLD,
     compute_non_display_threshold, NON_DISPLAY_BAND_FRACTION,
+    compute_display_clearance,
 )
 from support_utils import (
     Contact, build_tapered_support, build_raft, MODEL_RAISE,
@@ -107,7 +108,8 @@ class PartResult:
 
 def collect_downward_facets(mesh_world, mesh_part, non_display_dir_part,
                             require_non_display=True,
-                            band_mm=None, band_fraction=None):
+                            band_mm=None, band_fraction=None,
+                            min_display_clearance_mm=1.0):
     """Return list of (facet_index, centroid_world, normal_world, area) for
     downward overhangs on the non-display side.
 
@@ -116,6 +118,15 @@ def collect_downward_facets(mesh_world, mesh_part, non_display_dir_part,
     outer band along `non_display_dir_part`.  The two meshes must have the
     same facet ordering (one is just the rotated+shifted version of the
     other).
+
+    Additionally, facets with shallow "display clearance" are rejected:
+    a shingle step-underside sits only shingle-thickness (~0.7mm) below
+    the visible shingle top, so even if its position puts it in the
+    non-display band, a support tip there mars the visible shingle edge
+    (and the tapered support neck scrapes adjacent display faces).
+    `min_display_clearance_mm` sets the minimum required depth between a
+    facet and the display-visible surface above it at the same XY.
+    Set to 0 to disable the clearance filter.
 
     Parameters
     ----------
@@ -131,6 +142,11 @@ def collect_downward_facets(mesh_world, mesh_part, non_display_dir_part,
         If True, skip facets that aren't in the non-display region.
     band_fraction : float or None
         Override for NON_DISPLAY_BAND_FRACTION.
+    min_display_clearance_mm : float
+        Skip facets closer than this (in mm) to the display-visible
+        surface directly above them.  Default 1.0 mm excludes shingle
+        step-undersides (~0.7 mm) while keeping true hidden undersides
+        (shell-thickness, typically 1.5-3 mm).
     """
     out = []
     nd_threshold, _ = compute_non_display_threshold(
@@ -140,6 +156,14 @@ def collect_downward_facets(mesh_world, mesh_part, non_display_dir_part,
                  non_display_dir_part[2])
     if ndp.Length > 1e-9:
         ndp.normalize()
+
+    # Pre-compute per-facet clearance below display-visible surface, if
+    # clearance filtering is enabled.  Uses the PART-frame mesh with
+    # display_dir = -non_display_dir.
+    clearance = None
+    if min_display_clearance_mm > 0 and ndp.Length > 1e-9:
+        display_dir_part = (-ndp.x, -ndp.y, -ndp.z)
+        clearance = compute_display_clearance(mesh_part, display_dir_part)
 
     facets_w = mesh_world.Facets
     facets_p = mesh_part.Facets
@@ -164,6 +188,9 @@ def collect_downward_facets(mesh_world, mesh_part, non_display_dir_part,
             proj = cx * ndp.x + cy * ndp.y + cz * ndp.z
             if proj < nd_threshold:
                 continue
+
+        if clearance is not None and clearance[i] < min_display_clearance_mm:
+            continue
 
         pts_w = fw.Points
         cx = (pts_w[0][0] + pts_w[1][0] + pts_w[2][0]) / 3.0

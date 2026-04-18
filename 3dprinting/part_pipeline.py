@@ -73,12 +73,20 @@ class PartSpec:
         Label for the part (used in naming exported objects).
     candidates : list[OrientationCandidate] or None
         If None, uses the default candidate set.
+    band_mm : float or None
+        Override for the non-display band width (default 0.5 mm, tight
+        enough for a flush mating face).  Parts with DEEP recessed
+        mating features (tabs/recesses that go 2-3 mm into the part)
+        need a larger band so the recessed interior still counts as
+        non-display and gets supports.  E.g., for a slab with a 3 mm
+        deep mating recess, set band_mm=3.5.
     """
     non_display_dir: Sequence[float] = (0.0, 0.0, -1.0)
     name: str = "part"
     stl_path: Optional[str] = None
     mesh: Optional[Mesh.Mesh] = None
     candidates: Optional[list] = None
+    band_mm: Optional[float] = None
 
 
 @dataclass
@@ -165,19 +173,52 @@ def collect_downward_facets(mesh_world, mesh_part, non_display_dir_part,
     return out
 
 
-def cluster_facets_to_contacts(down_facets, grid_spacing=4.0,
-                               pick='lowest'):
-    """Bin downward facets into an XY grid and emit one Contact per cell.
+def _point_in_triangle_xy(px, py, p0, p1, p2):
+    """Barycentric point-in-triangle test in XY (ignore Z)."""
+    x0, y0 = p0[0], p0[1]
+    x1, y1 = p1[0], p1[1]
+    x2, y2 = p2[0], p2[1]
+    # Sign of each edge-half-plane
+    d = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+    if abs(d) < 1e-12:
+        return False
+    a = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / d
+    b = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / d
+    c = 1.0 - a - b
+    return a >= -1e-9 and b >= -1e-9 and c >= -1e-9
+
+
+def _interpolate_z_on_triangle(px, py, p0, p1, p2):
+    """Barycentric Z interpolation for a point inside the triangle's XY projection."""
+    x0, y0, z0 = p0[0], p0[1], p0[2]
+    x1, y1, z1 = p1[0], p1[1], p1[2]
+    x2, y2, z2 = p2[0], p2[1], p2[2]
+    d = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+    if abs(d) < 1e-12:
+        return (z0 + z1 + z2) / 3.0
+    a = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / d
+    b = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / d
+    c = 1.0 - a - b
+    return a * z0 + b * z1 + c * z2
+
+
+def rasterize_facets_to_contacts(down_facets, mesh_world, grid_spacing=4.0):
+    """Rasterize downward facets onto an XY grid; one Contact per covered cell.
+
+    Unlike centroid-based clustering, this handles coarsely-tessellated flat
+    faces correctly: a single 500 mm^2 triangle still produces a support in
+    every grid cell it covers, guaranteeing no magic islands.  For overlapping
+    triangles in a cell, the LOWEST Z wins (support terminates at the first
+    downward surface).
 
     Parameters
     ----------
     down_facets : list of (idx, centroid, normal, area)
+        From collect_downward_facets.  `idx` indexes into mesh_world.Facets.
+    mesh_world : Mesh.Mesh
+        The world-frame mesh (post-rotation, post-shift).
     grid_spacing : float
-        Cell size in mm for XY binning.  ~2-5 mm is typical.
-    pick : str
-        Which facet in a cell becomes the contact.  'lowest' picks min Z
-        (the most urgent overhang near the plate).  'centroid' averages
-        centroids of all facets in the cell.
+        Cell size in mm.
 
     Returns
     -------
@@ -185,28 +226,71 @@ def cluster_facets_to_contacts(down_facets, grid_spacing=4.0,
     """
     if not down_facets:
         return []
-    # Bin by (grid_x, grid_y)
+
+    facets = mesh_world.Facets
+    cells = {}   # (gx, gy) -> (x, y, z, normal)
+
+    # Pass 1: rasterize.  For each facet, mark every grid cell whose
+    # CENTER falls inside the facet's XY projection.  Guarantees full
+    # coverage of large flat regions (prevents magic islands).
+    for idx, _, n, _ in down_facets:
+        pts = facets[idx].Points
+        p0, p1, p2 = pts[0], pts[1], pts[2]
+        x_min = min(p0[0], p1[0], p2[0])
+        x_max = max(p0[0], p1[0], p2[0])
+        y_min = min(p0[1], p1[1], p2[1])
+        y_max = max(p0[1], p1[1], p2[1])
+        gx_lo = int(math.floor(x_min / grid_spacing))
+        gx_hi = int(math.floor(x_max / grid_spacing))
+        gy_lo = int(math.floor(y_min / grid_spacing))
+        gy_hi = int(math.floor(y_max / grid_spacing))
+        for gx in range(gx_lo, gx_hi + 1):
+            for gy in range(gy_lo, gy_hi + 1):
+                cx = (gx + 0.5) * grid_spacing
+                cy = (gy + 0.5) * grid_spacing
+                if not _point_in_triangle_xy(cx, cy, p0, p1, p2):
+                    continue
+                cz = _interpolate_z_on_triangle(cx, cy, p0, p1, p2)
+                existing = cells.get((gx, gy))
+                if existing is None or cz < existing[2]:
+                    cells[(gx, gy)] = (cx, cy, cz, n)
+
+    # Pass 2: ensure every facet contributes at least one contact.
+    # Narrow slivers (rim triangles) may not cover any cell center, yet
+    # still need support.  If a facet's centroid-cell isn't already
+    # covered (from pass 1 OR by another facet in this pass), place a
+    # contact at the centroid itself (not snapped to cell center).
+    for idx, c, n, a in down_facets:
+        gx = int(math.floor(c.x / grid_spacing))
+        gy = int(math.floor(c.y / grid_spacing))
+        if (gx, gy) in cells:
+            continue
+        cells[(gx, gy)] = (c.x, c.y, c.z, n)
+
+    return [Contact(x=x, y=y, z=z, nx=n.x, ny=n.y, nz=n.z, base_z=0.0)
+            for (x, y, z, n) in cells.values()]
+
+
+# Legacy name — kept as an alias in case any caller refers to the old
+# centroid-clustering behavior.  Prefer rasterize_facets_to_contacts.
+def cluster_facets_to_contacts(down_facets, grid_spacing=4.0, pick='lowest'):
+    """Deprecated: use rasterize_facets_to_contacts for proper coverage.
+
+    This centroid-based clustering undercounts coarsely-tessellated flat
+    faces (a 500 mm^2 triangle contributes ONE contact, missing entire
+    regions).  Kept only for backward compatibility.
+    """
+    if not down_facets:
+        return []
     buckets = {}
     for idx, c, n, a in down_facets:
         gx = int(math.floor(c.x / grid_spacing))
         gy = int(math.floor(c.y / grid_spacing))
         buckets.setdefault((gx, gy), []).append((idx, c, n, a))
-
     contacts = []
     for key, items in buckets.items():
-        if pick == 'lowest':
-            items.sort(key=lambda t: t[1].z)
-            idx, c, n, a = items[0]
-        else:
-            # area-weighted centroid
-            total_a = sum(t[3] for t in items)
-            cx = sum(t[1].x * t[3] for t in items) / total_a
-            cy = sum(t[1].y * t[3] for t in items) / total_a
-            cz = sum(t[1].z * t[3] for t in items) / total_a
-            # pick the facet closest to that centroid for its normal
-            items.sort(key=lambda t: (t[1].x - cx) ** 2 + (t[1].y - cy) ** 2)
-            _, _, n, _ = items[0]
-            c = Vector(cx, cy, cz)
+        items.sort(key=lambda t: t[1].z)
+        idx, c, n, a = items[0]
         contacts.append(Contact(x=c.x, y=c.y, z=c.z,
                                 nx=n.x, ny=n.y, nz=n.z, base_z=0.0))
     return contacts
@@ -260,6 +344,7 @@ def process_part(spec, printer='m7_pro', raise_amount=MODEL_RAISE,
         mesh_world=rotated, mesh_part=mesh,
         non_display_dir_part=spec.non_display_dir,
         require_non_display=True,
+        band_mm=spec.band_mm,
     )
     if verbose:
         total_down = len(down_facets)
@@ -267,8 +352,8 @@ def process_part(spec, printer='m7_pro', raise_amount=MODEL_RAISE,
         print(f"[{spec.name}] downward non-display facets: {total_down} "
               f"(total area {total_area:.1f} mm^2)")
 
-    contacts = cluster_facets_to_contacts(down_facets,
-                                          grid_spacing=grid_spacing)
+    contacts = rasterize_facets_to_contacts(down_facets, rotated,
+                                            grid_spacing=grid_spacing)
     if verbose:
         print(f"[{spec.name}] placed {len(contacts)} support contacts "
               f"(grid={grid_spacing}mm)")

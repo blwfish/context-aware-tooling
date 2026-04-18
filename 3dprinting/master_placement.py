@@ -72,6 +72,7 @@ class MasterInfo:
     depth_axis: int           # 0=X, 1=Y, 2=Z
     bbox_min: tuple = (0, 0, 0)
     bbox_max: tuple = (0, 0, 0)
+    casing_thickness: float = 0.0  # depth of frame/casing step from exterior
 
 
 @dataclass
@@ -480,6 +481,12 @@ def catalog_masters(doc, group_names=None):
         bbox_mins = [bb.XMin, bb.YMin, bb.ZMin]
         bbox_maxs = [bb.XMax, bb.YMax, bb.ZMax]
         min_area = float('inf')
+        # Also look for an interior step face that faces the exterior
+        # (normal in -depth direction, i.e. fn[depth_axis] < 0). That face
+        # sits at bbox_min + casing_thickness. Pick the face closest to
+        # bbox_min that isn't the bbox_min extreme itself.
+        casing_thickness = 0.0
+        casing_candidate = float('inf')
         for face in obj.Shape.Faces:
             if face.Surface.__class__.__name__ != "Plane":
                 continue
@@ -491,19 +498,31 @@ def catalog_masters(doc, group_names=None):
             # Faces aligned with the depth axis (normal along ±axis)
             if abs(n_comps[depth_axis]) < 0.95:
                 continue
-            # Only end faces: at the master's bbox extreme in depth
             fbb = face.BoundBox
             f_min = [fbb.XMin, fbb.YMin, fbb.ZMin][depth_axis]
             f_max = [fbb.XMax, fbb.YMax, fbb.ZMax][depth_axis]
-            if (abs(f_min - bbox_mins[depth_axis]) > 0.05 and
-                abs(f_max - bbox_maxs[depth_axis]) > 0.05):
+            at_min = abs(f_min - bbox_mins[depth_axis]) < 0.05
+            at_max = abs(f_max - bbox_maxs[depth_axis]) < 0.05
+
+            # Pane-size detection: end faces at a bbox extreme.
+            if at_min or at_max:
+                f_dims = [fbb.XLength, fbb.YLength, fbb.ZLength]
+                area = f_dims[width_axis] * f_dims[height_axis]
+                if area < min_area and area > 0:
+                    min_area = area
+                    pane_w = f_dims[width_axis]
+                    pane_h = f_dims[height_axis]
                 continue
-            f_dims = [fbb.XLength, fbb.YLength, fbb.ZLength]
-            area = f_dims[width_axis] * f_dims[height_axis]
-            if area < min_area and area > 0:
-                min_area = area
-                pane_w = f_dims[width_axis]
-                pane_h = f_dims[height_axis]
+
+            # Interior step face: frame (at bbox_min side) back annular
+            # face has normal pointing +depth_axis (toward pane/interior).
+            # Position is between bbox extremes. Pick the one closest to
+            # bbox_min — that's the casing back, at bbox_min + casing_thickness.
+            if n_comps[depth_axis] > 0:
+                step_offset = f_min - bbox_mins[depth_axis]
+                if 0.05 < step_offset < casing_candidate:
+                    casing_candidate = step_offset
+                    casing_thickness = step_offset
 
         catalog.append(MasterInfo(
             label=obj.Label,
@@ -513,6 +532,7 @@ def catalog_masters(doc, group_names=None):
             depth_axis=depth_axis,
             bbox_min=(bb.XMin, bb.YMin, bb.ZMin),
             bbox_max=(bb.XMax, bb.YMax, bb.ZMax),
+            casing_thickness=casing_thickness,
         ))
 
     logger.info("Cataloged %d masters from %s", len(catalog), groups_found)
@@ -616,9 +636,12 @@ def compute_placement(opening, master):
 
     wall_n = Vector(opening.normal_x, opening.normal_y, opening.normal_z)
 
-    # Rotation: map master depth axis to wall normal
-    # FreeCAD.Rotation(from_vec, to_vec) creates the shortest arc rotation
-    rot = Rotation(master_depth_dir, wall_n)
+    # Rotation: master's local +depth_axis points from frame (casing, at
+    # bbox_min[depth_axis]) to pane back (at bbox_max[depth_axis]). The
+    # frame sits against the wall exterior and the pane recedes into the
+    # opening, so master's +depth axis points AWAY from the exterior.
+    # Map +depth_axis to -wall_n so the frame lands on the exterior side.
+    rot = Rotation(master_depth_dir, -wall_n)
 
     # Master bounding box center in its local frame
     mx = (master.bbox_min[0] + master.bbox_max[0]) / 2
@@ -629,27 +652,23 @@ def compute_placement(opening, master):
     # After rotation, the master center moves to:
     rotated_center = rot.multVec(master_center)
 
-    # Master back face (exterior side) after rotation:
-    # The back of the master along its depth axis, rotated to wall normal direction.
-    # Back face offset from master center along depth = +depth/2
-    # After rotation, this becomes +depth/2 along wall_normal
+    # Frame face (exterior side) is at -depth/2 in local frame. After the
+    # rotation (+depth_axis -> -wall_n), the frame ends up at +depth/2
+    # along wall_n from the rotated master center.
     back_offset = master.depth / 2
 
-    # Target position: opening center, with back face at wall exterior
-    # The master center should be at:
-    #   - opening center in wall-parallel plane
-    #   - along wall normal: exterior_offset - depth/2 (so back face at exterior)
+    # We want the frame BACK (casing's inside face, at local +casing_thickness
+    # from frame front) to sit flush with the clapboard surface at
+    # exterior_offset. The frame's FRONT protrudes by casing_thickness.
+    # master_center_along_wall_n = exterior_offset - depth/2 + casing_thickness
     target = Vector(opening.center_x, opening.center_y, opening.center_z)
 
-    # Adjust along wall normal: place master center so its back is at exterior
-    # Currently target is at opening center. The opening center along the normal
-    # is at some point inside the wall. We want:
-    #   master_center_along_normal = exterior_offset - depth/2
-    # Current opening center along normal:
     opening_normal_offset = (opening.center_x * opening.normal_x +
                               opening.center_y * opening.normal_y +
                               opening.center_z * opening.normal_z)
-    desired_normal_offset = opening.exterior_offset - back_offset
+    desired_normal_offset = (opening.exterior_offset
+                             - back_offset
+                             + master.casing_thickness)
     shift = desired_normal_offset - opening_normal_offset
 
     target = Vector(

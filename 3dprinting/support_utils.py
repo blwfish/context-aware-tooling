@@ -819,57 +819,104 @@ def build_supports(contacts, raft_top_z=0.0):
     return compound
 
 
+def _convex_hull_xy(points):
+    """Andrew's monotone chain 2D convex hull of a list of (x, y) tuples.
+    Returns CCW-ordered vertices without repeating the start."""
+    if len(points) < 2:
+        return list(points)
+    pts = sorted(set((round(p[0], 4), round(p[1], 4)) for p in points))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
 def build_raft(shape, contacts=None, margin=RAFT_MARGIN,
                thickness=RAFT_THICKNESS, chamfer=RAFT_CHAMFER):
     """
-    Build a raft under the model with chamfered bottom edges.
-
-    The raft is sized to cover the model footprint AND all support
-    base pad positions (whichever extent is larger).
+    Build a raft under the model, shaped as the 2D convex hull of the
+    model footprint plus all support base pad positions, offset
+    outward by `margin`.  This hugs irregular parts (hexagonal,
+    figurine, etc.) much tighter than an axis-aligned bounding box.
 
     Parameters
     ----------
     shape : Part.Shape
-        The model shape (used to compute footprint).
+        The model shape (used to gather footprint points).
     contacts : list of Contact or None
         Support contacts.  Raft extends to cover all base pads.
     margin : float
-        Extension beyond footprint.
+        Outward polygon offset applied to the hull.
     thickness : float
         Raft thickness.
     chamfer : float
-        Chamfer size on bottom edges.
+        Chamfer size on bottom edges (applied only if the outline is a
+        simple rectangle; skipped otherwise since irregular polygons
+        can confuse makeChamfer).
 
     Returns
     -------
     Part.Shape
     """
-    bb = shape.BoundBox
+    # Gather XY points: every vertex of the model shape + every contact
+    # position.  Vertices give us the true footprint outline, not just
+    # the AABB.
+    xy_points = []
+    try:
+        for v in shape.Vertexes:
+            xy_points.append((v.X, v.Y))
+    except Exception:
+        bb = shape.BoundBox
+        xy_points = [(bb.XMin, bb.YMin), (bb.XMax, bb.YMin),
+                     (bb.XMax, bb.YMax), (bb.XMin, bb.YMax)]
 
-    x0 = bb.XMin
-    x1 = bb.XMax
-    y0 = bb.YMin
-    y1 = bb.YMax
-
-    # Expand to cover all support base pad positions
     if contacts:
         for c in contacts:
-            x0 = min(x0, c.x - BASE_PAD_RADIUS)
-            x1 = max(x1, c.x + BASE_PAD_RADIUS)
-            y0 = min(y0, c.y - BASE_PAD_RADIUS)
-            y1 = max(y1, c.y + BASE_PAD_RADIUS)
+            # Each base pad is a disk of BASE_PAD_RADIUS around (c.x, c.y).
+            # Sample 4 points on the disk boundary so the hull covers it.
+            for dx, dy in ((BASE_PAD_RADIUS, 0), (-BASE_PAD_RADIUS, 0),
+                           (0, BASE_PAD_RADIUS), (0, -BASE_PAD_RADIUS)):
+                xy_points.append((c.x + dx, c.y + dy))
 
-    # Apply margin
-    x0 -= margin
-    x1 += margin
-    y0 -= margin
-    y1 += margin
+    hull = _convex_hull_xy(xy_points)
+    if len(hull) < 3:
+        # Degenerate — fall back to AABB
+        bb = shape.BoundBox
+        hull = [(bb.XMin - margin, bb.YMin - margin),
+                (bb.XMax + margin, bb.YMin - margin),
+                (bb.XMax + margin, bb.YMax + margin),
+                (bb.XMin - margin, bb.YMax + margin)]
 
-    raft = Part.makeBox(x1 - x0, y1 - y0, thickness,
-                        Vector(x0, y0, -thickness))
+    # Build a Face from the hull polygon, offset outward by `margin`,
+    # then extrude to thickness.
+    hull_pts = [Vector(x, y, -thickness) for (x, y) in hull]
+    hull_pts.append(hull_pts[0])   # close
+    wire = Part.makePolygon(hull_pts)
+    face = Part.Face(wire)
+    if margin > 0:
+        try:
+            face = face.makeOffset2D(margin, join=0, fill=False)
+        except Exception as e:
+            logger.warning("Raft polygon offset failed (%s); using un-offset hull", e)
 
-    # Chamfer bottom edges
-    if chamfer > 0:
+    raft = face.extrude(Vector(0, 0, thickness))
+
+    # Chamfer only if hull ended up as a 4-edge rectangle (the simple case).
+    # Chamfering an arbitrary polygon's bottom edges is brittle.
+    if chamfer > 0 and len(raft.Edges) == 12:   # 4 bottom + 4 top + 4 vertical
         bottom_edges = [e for e in raft.Edges
                         if (abs(e.BoundBox.ZMin + thickness) < 0.01 and
                             abs(e.BoundBox.ZMax + thickness) < 0.01)]
@@ -879,7 +926,14 @@ def build_raft(shape, contacts=None, margin=RAFT_MARGIN,
             except Exception as e:
                 logger.warning("Raft chamfer failed: %s", e)
 
-    print(f"Raft: {x1-x0:.1f} x {y1-y0:.1f} x {thickness} "
+    bb_raft = raft.BoundBox
+    # Approximate area as polygon area from face
+    try:
+        area = face.Area
+    except Exception:
+        area = bb_raft.XLength * bb_raft.YLength
+    print(f"Raft: hull polygon, area {area:.0f} mm^2, "
+          f"bbox {bb_raft.XLength:.1f} x {bb_raft.YLength:.1f} x {thickness} "
           f"at Z=[{-thickness:.1f}, 0]")
     return raft
 

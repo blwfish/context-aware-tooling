@@ -24,6 +24,7 @@ from FreeCAD import Vector
 import math
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,16 @@ class Contact:
     ny: float = 0.0
     nz: float = -1.0
     base_z: float = 0.0
+    # Optional override for where the support column sits in XY relative
+    # to the tip.  When set, the column is placed so its base is offset
+    # by (neck_toward_x, neck_toward_y) * NECK_HEIGHT in XY (and below
+    # the tip vertically), so the tapered neck approaches the tip from
+    # THIS direction.  Use it to steer the neck into open space — e.g.,
+    # for a rim contact, point it toward the mating-face interior so
+    # the neck doesn't scrape adjacent visible geometry.
+    # None = fall back to the old -face_normal_xy behavior.
+    neck_toward_x: Optional[float] = None
+    neck_toward_y: Optional[float] = None
 
     @property
     def face_normal(self):
@@ -695,24 +706,43 @@ def build_tapered_support(contact, raft_top_z=0.0, include_base_pad=True):
 
     fnx, fny, fnz = contact.face_normal
     fn_len = math.sqrt(fnx*fnx + fny*fny + fnz*fnz)
-    has_normal = fn_len > 0.01 and not (fnx == 0 and fny == 0)
+    # If an explicit neck direction is given, honor it even when the
+    # face normal XY is near zero (pure downward facet).  Otherwise the
+    # original "neck tilts opposite of face normal" logic kicks in.
+    use_explicit_neck = (contact.neck_toward_x is not None and
+                         contact.neck_toward_y is not None and
+                         (contact.neck_toward_x ** 2 + contact.neck_toward_y ** 2) > 1e-6)
+    has_normal = fn_len > 0.01 and (not (fnx == 0 and fny == 0) or use_explicit_neck)
 
     if has_normal:
-        # Normalize
+        # Normalize face normal
         fnx, fny, fnz = fnx/fn_len, fny/fn_len, fnz/fn_len
 
-        # Angled approach: column stands at offset XY, neck sweeps along
-        # face normal to reach the contact.  Like commercial slicers.
-
-        # Sphere center: contact + TIP_RADIUS along face normal
+        # Sphere center: contact + TIP_RADIUS along face normal.  Keeps
+        # the sphere tangent to the facet from outside (only the tip
+        # touches the model).
         sc = Vector(cx + TIP_RADIUS * fnx,
                     cy + TIP_RADIUS * fny,
                     cz + TIP_RADIUS * fnz)
-        # Neck base: NECK_HEIGHT below the sphere, displaced toward building
-        # INTERIOR in XY.  Face normal XY points toward exterior (away from
-        # solid), so flip XY to get interior direction.  Keep Z (downward).
-        nb = Vector(sc.x - NECK_HEIGHT * fnx,
-                    sc.y - NECK_HEIGHT * fny,
+
+        # Column XY offset from the tip.  When an explicit neck_toward
+        # direction is set, use it (aim the neck into safe open space —
+        # e.g., toward the mating-face interior, away from nearby
+        # visible detail).  Otherwise fall back to -face_normal_xy
+        # (interior of the solid, good for wall supports).
+        if use_explicit_neck:
+            tx, ty = contact.neck_toward_x, contact.neck_toward_y
+            t_len = math.sqrt(tx*tx + ty*ty)
+            dx, dy = tx / t_len, ty / t_len
+        else:
+            dx, dy = -fnx, -fny
+
+        # Neck base: NECK_HEIGHT along (dx, dy, fnz-down).  Z always
+        # below the sphere.  Assumes the contact is a downward-facing
+        # facet (fnz < 0), which is the normal case for raft-based
+        # supports.
+        nb = Vector(sc.x + NECK_HEIGHT * dx,
+                    sc.y + NECK_HEIGHT * dy,
                     sc.z + NECK_HEIGHT * fnz)
 
         # Column is vertical at neck_base XY position

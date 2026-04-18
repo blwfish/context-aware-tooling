@@ -340,8 +340,30 @@ def rasterize_facets_to_contacts(down_facets, mesh_world, grid_spacing=4.0):
         if not has_neighbor:
             cells[("extremum", key)] = (bx, by, bz, bn)
 
-    return [Contact(x=x, y=y, z=z, nx=n.x, ny=n.y, nz=n.z, base_z=0.0)
-            for (x, y, z, n) in cells.values()]
+    # Steer each support's neck toward the centroid of the contact set
+    # in XY.  For a rim contact, this aims the neck-to-tip approach
+    # INWARD (through the mating-face interior, i.e. open air) so the
+    # tapered neck doesn't scrape adjacent visible detail.  The face
+    # normal is preserved — only the column's XY offset changes.
+    if len(cells) >= 2:
+        cx_mean = sum(v[0] for v in cells.values()) / len(cells)
+        cy_mean = sum(v[1] for v in cells.values()) / len(cells)
+    else:
+        cx_mean = cy_mean = 0.0
+
+    contacts = []
+    for (x, y, z, n) in cells.values():
+        dx = cx_mean - x
+        dy = cy_mean - y
+        d = math.sqrt(dx * dx + dy * dy)
+        if d > 1e-6:
+            ntx, nty = dx / d, dy / d
+        else:
+            ntx = nty = 0.0  # contact sits AT centroid, no steering needed
+        contacts.append(Contact(x=x, y=y, z=z,
+                                nx=n.x, ny=n.y, nz=n.z, base_z=0.0,
+                                neck_toward_x=ntx, neck_toward_y=nty))
+    return contacts
 
 
 # Legacy name — kept as an alias in case any caller refers to the old

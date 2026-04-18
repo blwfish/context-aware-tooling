@@ -687,7 +687,7 @@ def compute_placement(opening, master):
 # Phase 4: Execution
 # ---------------------------------------------------------------------------
 
-def place_master(doc, opening, master, mode='separate'):
+def place_master(doc, opening, master, mode='separate', manage_transaction=True):
     """Place a single master into an opening.
 
     Parameters
@@ -698,6 +698,10 @@ def place_master(doc, opening, master, mode='separate'):
     mode : str
         'fuse' — boolean fuse master into wall solid.
         'separate' — position master as an independent Part::Feature.
+    manage_transaction : bool
+        If True, open/commit a transaction around the placement so it
+        is individually undoable. Set False when a caller (e.g.
+        place_all_masters) already holds an outer transaction.
 
     Returns
     -------
@@ -731,15 +735,17 @@ def place_master(doc, opening, master, mode='separate'):
         if wall_obj is None:
             raise ValueError(f"Wall object '{opening.wall_label}' not found")
 
-        label = f"{master.label}_in_{opening.wall_label}"
-        doc.openTransaction(f"Fuse master '{master.label}' into '{opening.wall_label}'")
+        if manage_transaction:
+            doc.openTransaction(f"Fuse master '{master.label}' into '{opening.wall_label}'")
         try:
             fused = wall_obj.Shape.fuse(placed_shape)
             wall_obj.Shape = fused
-            doc.recompute()
-            doc.commitTransaction()
+            if manage_transaction:
+                doc.recompute()
+                doc.commitTransaction()
         except Exception:
-            doc.abortTransaction()
+            if manage_transaction:
+                doc.abortTransaction()
             raise
 
         return PlacementResult(
@@ -750,14 +756,17 @@ def place_master(doc, opening, master, mode='separate'):
 
     else:  # separate
         label = f"{master.label}_placed"
-        doc.openTransaction(f"Place master '{master.label}'")
+        if manage_transaction:
+            doc.openTransaction(f"Place master '{master.label}'")
         try:
             new_obj = doc.addObject("Part::Feature", label)
             new_obj.Shape = placed_shape
-            doc.recompute()
-            doc.commitTransaction()
+            if manage_transaction:
+                doc.recompute()
+                doc.commitTransaction()
         except Exception:
-            doc.abortTransaction()
+            if manage_transaction:
+                doc.abortTransaction()
             raise
 
         return PlacementResult(
@@ -805,16 +814,24 @@ def place_all_masters(doc, wall_group=None, master_groups=None,
     print(f"Matched {len(matches)} openings to masters. Placing ({mode} mode)...")
 
     results = []
-    for opening, master in matches:
-        try:
-            result = place_master(doc, opening, master, mode)
-            results.append(result)
-            print(f"  Placed '{master.label}' at ({opening.center_x:.1f}, "
-                  f"{opening.center_y:.1f}, {opening.center_z:.1f}) "
-                  f"gap: {result.gap_w:.2f} x {result.gap_h:.2f} mm")
-        except Exception as e:
-            logger.error("Failed to place '%s': %s", master.label, e)
-            print(f"  FAILED '{master.label}': {e}")
+    doc.openTransaction(f"Place {len(matches)} masters ({mode})")
+    try:
+        for opening, master in matches:
+            try:
+                result = place_master(doc, opening, master, mode,
+                                      manage_transaction=False)
+                results.append(result)
+                print(f"  Placed '{master.label}' at ({opening.center_x:.1f}, "
+                      f"{opening.center_y:.1f}, {opening.center_z:.1f}) "
+                      f"gap: {result.gap_w:.2f} x {result.gap_h:.2f} mm")
+            except Exception as e:
+                logger.error("Failed to place '%s': %s", master.label, e)
+                print(f"  FAILED '{master.label}': {e}")
+        doc.recompute()
+        doc.commitTransaction()
+    except Exception:
+        doc.abortTransaction()
+        raise
 
     print(f"Placed {len(results)}/{len(matches)} masters successfully.")
     return results

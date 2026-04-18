@@ -218,26 +218,28 @@ def generate_candidates(include_tilts=True):
 
     if include_tilts:
         # Tilts applied on top of "part-Zdown" (part sits upright) and
-        # "part+Zdown" (flipped).  Range covers mild (10°) through
-        # aggressive (30°) since slabs need steep tilt to dodge peel-
-        # force penalties on the mating face.
-        tilt_set = (10, 18, 25, 30)
-        base = _rot((0, 0, 1), 0)   # identity
-        for tilt_x in tilt_set:
-            for twist_z in (0, 8):
-                rot = _compose(base, _rot((1, 0, 0), tilt_x), _rot((0, 0, 1), twist_z))
-                cands.append(OrientationCandidate(
-                    name=f"part-Zdown+tilt{tilt_x}z{twist_z}",
-                    rotation=rot,
-                ))
-        base_flip = _rot((1, 0, 0), 180)
-        for tilt_x in tilt_set:
-            for twist_z in (0, 8):
-                rot = _compose(base_flip, _rot((1, 0, 0), tilt_x), _rot((0, 0, 1), twist_z))
-                cands.append(OrientationCandidate(
-                    name=f"part+Zdown+tilt{tilt_x}z{twist_z}",
-                    rotation=rot,
-                ))
+        # "part+Zdown" (flipped).  We tilt on BOTH X and Y so the slab
+        # peels diagonally from one corner rather than from a whole
+        # edge at once — single-axis tilt still peels a full edge
+        # simultaneously, two-axis tilt peels a growing triangular
+        # wedge per layer.  X covers 10-30°, Y adds a milder secondary
+        # tilt of 0-10°.
+        x_tilts = (10, 18, 25, 30)
+        y_tilts = (0, 10)
+        base = _rot((0, 0, 1), 0)          # identity
+        base_flip = _rot((1, 0, 0), 180)   # upside-down
+        for base_name, base_rot in (("part-Zdown", base),
+                                     ("part+Zdown", base_flip)):
+            for tilt_x in x_tilts:
+                for tilt_y in y_tilts:
+                    rot = _compose(base_rot,
+                                   _rot((1, 0, 0), tilt_x),
+                                   _rot((0, 1, 0), tilt_y))
+                    suffix = f"x{tilt_x}" + (f"y{tilt_y}" if tilt_y else "")
+                    cands.append(OrientationCandidate(
+                        name=f"{base_name}+tilt{suffix}",
+                        rotation=rot,
+                    ))
 
     return cands
 

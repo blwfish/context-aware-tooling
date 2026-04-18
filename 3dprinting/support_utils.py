@@ -104,7 +104,10 @@ RAFT_MARGIN = 2.0              # mm beyond footprint
 RAFT_THICKNESS = 1.5           # mm
 RAFT_CHAMFER = 0.4             # mm
 
-MODEL_RAISE = 2.0              # mm to raise model off raft
+MODEL_RAISE = 5.0              # mm to raise model off raft (minimum
+                                # support height; shorter supports are
+                                # hard to clip cleanly without marring
+                                # the underside, even before curing)
 
 # Dual-axis tilt defaults
 DEFAULT_X_TILT = 18.0          # degrees around X axis (peel reduction)

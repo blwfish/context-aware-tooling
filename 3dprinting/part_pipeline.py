@@ -267,6 +267,26 @@ def rasterize_facets_to_contacts(down_facets, mesh_world, grid_spacing=4.0):
             continue
         cells[(gx, gy)] = (c.x, c.y, c.z, n)
 
+    # Pass 3: extremal-point guard.  The absolute lowest vertex of any
+    # downward facet is the magic-island hot spot — the first layer
+    # lands there.  Even with rasterization, the true corner can sit
+    # BETWEEN grid cell centers and never get a support.  Walk every
+    # downward facet vertex, find the minimum-Z one, and place a
+    # support directly under it if no existing contact is close enough.
+    low_x, low_y, low_z, low_n = None, None, float('inf'), None
+    for idx, _, n, _ in down_facets:
+        pts = facets[idx].Points
+        for p in pts:
+            if p[2] < low_z:
+                low_x, low_y, low_z, low_n = p[0], p[1], p[2], n
+    if low_n is not None:
+        # Is any existing contact within grid_spacing of the low point?
+        near_r2 = grid_spacing * grid_spacing
+        has_neighbor = any((x - low_x) ** 2 + (y - low_y) ** 2 < near_r2
+                           for (x, y, _, _) in cells.values())
+        if not has_neighbor:
+            cells[("extremum", "low")] = (low_x, low_y, low_z, low_n)
+
     return [Contact(x=x, y=y, z=z, nx=n.x, ny=n.y, nz=n.z, base_z=0.0)
             for (x, y, z, n) in cells.values()]
 

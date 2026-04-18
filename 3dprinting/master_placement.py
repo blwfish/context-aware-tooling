@@ -29,6 +29,9 @@ DEFAULT_MAX_MARGIN = 1.0      # mm max gap between master and opening
 DEFAULT_MIN_MARGIN = 0.05     # mm min gap (~laser kerf clearance)
 TUNNEL_FACE_MIN_AREA = 0.1    # mm² skip boolean artifacts
 GROUPING_TOL = 0.5            # mm max gap for grouping tunnel faces
+NORMAL_CLUSTER_TOL = 0.02     # 1-dot threshold when bucketing face normals (~11°)
+THICKNESS_SPAN_TOL = 0.15     # fraction: tunnel face must span wall thickness within 15%
+PERIMETER_MARGIN = 1.0        # mm: cluster bbox must stay this far inside wall silhouette
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +90,13 @@ class PlacementResult:
 # ---------------------------------------------------------------------------
 
 def detect_wall_normal(wall_shape):
-    """Find the dominant wall normal from the two largest planar faces.
+    """Find the dominant wall normal via area-weighted normal clustering.
+
+    Bucket all planar faces by axis direction (treating n and -n as the
+    same axis), sum areas within each bucket, and pick the bucket with
+    the largest total area — those are the wall front + back faces,
+    which sum to roughly 2 × wall_area even when clapboard/trim detail
+    has shattered each slab into many small pieces.
 
     Returns (normal_tuple, exterior_offset) where normal points outward
     from the wall exterior and exterior_offset is the signed distance
@@ -101,54 +110,95 @@ def detect_wall_normal(wall_shape):
     -------
     tuple : ((nx, ny, nz), exterior_offset)
     """
-    # Collect planar faces with their areas and normals
     planar_faces = []
     for face in wall_shape.Faces:
         if face.Area < TUNNEL_FACE_MIN_AREA:
+            continue
+        if face.Surface.__class__.__name__ != "Plane":
             continue
         try:
             normal = face.normalAt(0, 0)
         except Exception:
             continue
-        # Check if face is planar: all vertex normals should be similar
-        # For a truly planar face, the surface type is Plane
-        surf_type = face.Surface.__class__.__name__
-        if surf_type == "Plane":
-            planar_faces.append((face.Area, normal, face))
+        planar_faces.append((face.Area, normal, face))
 
-    if len(planar_faces) < 2:
-        raise ValueError("Wall shape has fewer than 2 planar faces")
+    if not planar_faces:
+        raise ValueError("Wall shape has no planar faces")
 
-    # Sort by area descending — the two largest are exterior and interior
-    planar_faces.sort(key=lambda x: x[0], reverse=True)
+    # Bucket by axis direction. Canonicalize each normal so n and -n
+    # land in the same bucket (orient first nonzero component positive).
+    def canonical(n):
+        for c in (n.x, n.y, n.z):
+            if abs(c) > 1e-6:
+                sign = 1.0 if c > 0 else -1.0
+                return (sign * n.x, sign * n.y, sign * n.z)
+        return (n.x, n.y, n.z)
 
-    area1, n1, f1 = planar_faces[0]
-    area2, n2, f2 = planar_faces[1]
-
-    # The two wall faces should have opposing normals
-    dot = n1.x * n2.x + n1.y * n2.y + n1.z * n2.z
-    if dot > 0:
-        # Same direction — try to find the actual opposing face
-        for i in range(2, len(planar_faces)):
-            ai, ni, fi = planar_faces[i]
-            di = n1.x * ni.x + n1.y * ni.y + n1.z * ni.z
-            if di < -0.5:
-                area2, n2, f2 = ai, ni, fi
+    buckets = []  # list of {axis, total_area, faces: [(area, normal, face)...]}
+    for area, normal, face in planar_faces:
+        c = canonical(normal)
+        matched = None
+        for b in buckets:
+            ax, ay, az = b["axis"]
+            # 1 - dot of unit vectors; both are unit length
+            delta = 1.0 - (c[0]*ax + c[1]*ay + c[2]*az)
+            if delta < NORMAL_CLUSTER_TOL:
+                matched = b
                 break
+        if matched is None:
+            buckets.append({"axis": c, "total_area": area,
+                            "faces": [(area, normal, face)]})
+        else:
+            matched["total_area"] += area
+            matched["faces"].append((area, normal, face))
 
-    # Exterior face is the one with larger offset along its normal
-    offset1 = f1.CenterOfMass.x * n1.x + f1.CenterOfMass.y * n1.y + f1.CenterOfMass.z * n1.z
-    offset2 = f2.CenterOfMass.x * n2.x + f2.CenterOfMass.y * n2.y + f2.CenterOfMass.z * n2.z
+    # Largest-area bucket = the wall front+back axis
+    buckets.sort(key=lambda b: b["total_area"], reverse=True)
+    wall_bucket = buckets[0]
 
-    # Normalize: exterior normal points outward (larger offset)
-    if offset1 >= offset2:
-        ext_normal = n1
-        ext_offset = offset1
+    # Within the winning bucket, split faces into +direction and -direction
+    # based on their actual normal (canonicalization collapsed them).
+    ax, ay, az = wall_bucket["axis"]
+    pos_faces, neg_faces = [], []
+    for area, normal, face in wall_bucket["faces"]:
+        if normal.x * ax + normal.y * ay + normal.z * az > 0:
+            pos_faces.append((area, normal, face))
+        else:
+            neg_faces.append((area, normal, face))
+
+    def offset_of(faces, axis):
+        # Area-weighted offset of face centroids along the axis.
+        if not faces:
+            return None
+        ax_, ay_, az_ = axis
+        total_a = sum(a for a, _, _ in faces)
+        acc = 0.0
+        for a, _, f in faces:
+            com = f.CenterOfMass
+            acc += a * (com.x * ax_ + com.y * ay_ + com.z * az_)
+        return acc / total_a
+
+    pos_along_axis = offset_of(pos_faces, wall_bucket["axis"])
+    neg_along_axis = offset_of(neg_faces, wall_bucket["axis"])
+
+    # Exterior = face that is further from origin along its own outward
+    # normal. For pos faces (normal = +axis), that distance equals
+    # pos_along_axis. For neg faces (normal = -axis), it equals
+    # -neg_along_axis. Pick whichever is larger.
+    pos_outward = pos_along_axis
+    neg_outward = -neg_along_axis if neg_along_axis is not None else None
+
+    if pos_outward is None:
+        ext_axis = (-ax, -ay, -az)
+        ext_offset = neg_outward
+    elif neg_outward is None or pos_outward >= neg_outward:
+        ext_axis = (ax, ay, az)
+        ext_offset = pos_outward
     else:
-        ext_normal = n2
-        ext_offset = offset2
+        ext_axis = (-ax, -ay, -az)
+        ext_offset = neg_outward
 
-    return (ext_normal.x, ext_normal.y, ext_normal.z), ext_offset
+    return ext_axis, ext_offset
 
 
 def _faces_overlap_2d(bb1, bb2, axis_indices, tol):
@@ -167,153 +217,130 @@ def _bbox_tuple(face):
     return (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax)
 
 
-def find_openings(wall_shape, wall_normal, wall_label="", tol=None):
-    """Detect rectangular openings in a wall solid.
+def find_openings(wall_shape, wall_normal=None, wall_label="", tol=None):
+    """Detect openings per-face, one opening per inner wire.
 
-    Identifies tunnel faces (normals perpendicular to wall_normal),
-    groups them by spatial proximity, and extracts opening geometry.
+    For each planar face F with inner wire(s), treat F as an "interior"
+    wall face:
+      - exterior normal = -F.normalAt()
+      - wall_thickness = extent of F's parent solid along exterior normal
+      - exterior_offset = max projection of that solid along exterior normal
+      - each inner wire becomes one Opening
+
+    This handles single slabs, multi-solid compounds (each solid has its
+    own interior face), mirrors, and multi-facet walls (bays) where each
+    facet has a different normal — all via the same per-face logic.
 
     Parameters
     ----------
     wall_shape : Part.Shape
-    wall_normal : tuple
-        (nx, ny, nz) outward normal of the wall exterior.
+    wall_normal : tuple, optional
+        (nx, ny, nz) — if given, used as an alignment hint to prune faces
+        whose -outward_normal doesn't roughly match it.  Useful for clean
+        slab walls (tests) where both sides carry inner wires.  For
+        clapboarded real walls, the exterior face is shattered and won't
+        pass the inner-wire test anyway, so the hint is unnecessary.
     wall_label : str
         Label for provenance.
     tol : float, optional
-        Perpendicularity tolerance. Defaults to PERPENDICULAR_TOL.
+        Ignored — kept for backward compatibility.
 
     Returns
     -------
     list[Opening]
     """
-    if tol is None:
-        tol = PERPENDICULAR_TOL
-
-    nx, ny, nz = wall_normal
-
-    # Determine wall-parallel axes for grouping
-    # wall_length_dir = wall_normal x Z (or wall_normal x X if wall is horizontal)
-    up = (0, 0, 1)
-    # Cross product: normal x up
-    lx = ny * up[2] - nz * up[1]
-    ly = nz * up[0] - nx * up[2]
-    lz = nx * up[1] - ny * up[0]
-    length_mag = math.sqrt(lx*lx + ly*ly + lz*lz)
-    if length_mag < 0.01:
-        # Wall is horizontal (rare), use X as length direction
-        lx, ly, lz = 1, 0, 0
-    else:
-        lx /= length_mag
-        ly /= length_mag
-        lz /= length_mag
-
-    # Collect tunnel faces: normals perpendicular to wall normal
-    tunnel_faces = []
-    for face in wall_shape.Faces:
-        if face.Area < TUNNEL_FACE_MIN_AREA:
-            continue
-        try:
-            fn = face.normalAt(0, 0)
-        except Exception:
-            continue
-        dot = fn.x * nx + fn.y * ny + fn.z * nz
-        if abs(dot) < tol:
-            tunnel_faces.append(face)
-
-    if not tunnel_faces:
-        return []
-
-    # Group tunnel faces by spatial proximity using union-find
-    n = len(tunnel_faces)
-    parent = list(range(n))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[ri] = rj
-
-    bboxes = [_bbox_tuple(f) for f in tunnel_faces]
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            # Check if bboxes overlap or are very close in wall-parallel plane
-            bi, bj = bboxes[i], bboxes[j]
-            # Use all 3 axes for proximity — faces of the same opening
-            # will share edges or be adjacent
-            close = True
-            for k in range(3):
-                gap = max(bi[k], bj[k]) - min(bi[k+3], bj[k+3])
-                if gap > GROUPING_TOL:
-                    close = False
-                    break
-            if close:
-                union(i, j)
-
-    # Collect groups
-    groups = {}
-    for i in range(n):
-        root = find(i)
-        if root not in groups:
-            groups[root] = []
-        groups[root].append(i)
-
-    # Extract opening geometry from each group
     openings = []
-    for indices in groups.values():
-        if len(indices) < 2:
-            # Need at least 2 tunnel faces for a real opening
-            continue
+    seen = set()  # dedup by (rounded center, rounded dims)
 
-        # Aggregate bounding box of all faces in this group
-        xmins = [bboxes[i][0] for i in indices]
-        ymins = [bboxes[i][1] for i in indices]
-        zmins = [bboxes[i][2] for i in indices]
-        xmaxs = [bboxes[i][3] for i in indices]
-        ymaxs = [bboxes[i][4] for i in indices]
-        zmaxs = [bboxes[i][5] for i in indices]
+    for solid in wall_shape.Solids:
+        verts = [(v.X, v.Y, v.Z) for v in solid.Vertexes]
 
-        xmin, ymin, zmin = min(xmins), min(ymins), min(zmins)
-        xmax, ymax, zmax = max(xmaxs), max(ymaxs), max(zmaxs)
+        for face in solid.Faces:
+            if face.Area < TUNNEL_FACE_MIN_AREA:
+                continue
+            if face.Surface.__class__.__name__ != "Plane":
+                continue
+            try:
+                outer = face.OuterWire
+            except Exception:
+                continue
+            inner_wires = [w for w in face.Wires if not w.isSame(outer)]
+            if not inner_wires:
+                continue
+            try:
+                fn = face.normalAt(0, 0)
+            except Exception:
+                continue
+            # Skip near-horizontal faces (floor/ceiling, not wall).
+            if abs(fn.z) > 0.9:
+                continue
 
-        center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+            # Wall exterior normal: face is assumed interior, so exterior
+            # points opposite face's outward normal.
+            ex_nx, ex_ny, ex_nz = -fn.x, -fn.y, -fn.z
 
-        # Width = extent along wall-length direction
-        # Height = extent along Z
-        # Wall thickness = extent along wall-normal direction
-        dx, dy, dz = xmax - xmin, ymax - ymin, zmax - zmin
+            # Alignment hint: skip faces whose exterior doesn't roughly
+            # match the hinted wall_normal (lets tests on clean slabs
+            # disambiguate between the two faces that both carry wires).
+            if wall_normal is not None:
+                hx, hy, hz = wall_normal
+                if ex_nx*hx + ex_ny*hy + ex_nz*hz < 0.5:
+                    continue
 
-        # Project extent onto wall-length direction
-        width = abs(dx * lx + dy * ly + dz * lz)
-        # Height is Z extent
-        height = dz
-        # Wall thickness is extent along wall normal
-        thickness = abs(dx * nx + dy * ny + dz * nz)
+            # Per-solid wall_thickness along this face's exterior normal.
+            projs = [v[0]*ex_nx + v[1]*ex_ny + v[2]*ex_nz for v in verts]
+            solid_max_proj = max(projs)
+            fc = face.CenterOfMass
+            face_proj = fc.x*ex_nx + fc.y*ex_ny + fc.z*ex_nz
+            wall_thickness = solid_max_proj - face_proj
+            exterior_offset = solid_max_proj
 
-        # For axis-aligned walls, simplify:
-        # If normal is along X: thickness=dx, width from ly/lz
-        # If normal is along Y: thickness=dy, width from lx/lz
-        # Use the more robust projected approach above
+            # In-plane "length" direction: perpendicular to ex_normal and world Z.
+            lx = ex_ny * 1.0 - ex_nz * 0.0
+            ly = ex_nz * 0.0 - ex_nx * 1.0
+            lz = ex_nx * 0.0 - ex_ny * 0.0
+            lm = math.sqrt(lx*lx + ly*ly + lz*lz)
+            if lm < 0.01:
+                lx, ly, lz = 1.0, 0.0, 0.0
+            else:
+                lx /= lm; ly /= lm; lz /= lm
 
-        openings.append(Opening(
-            center_x=center[0],
-            center_y=center[1],
-            center_z=center[2],
-            width=width,
-            height=height,
-            wall_thickness=thickness,
-            normal_x=nx,
-            normal_y=ny,
-            normal_z=nz,
-            exterior_offset=0.0,  # filled in by caller or find_all_openings
-            wall_label=wall_label,
-        ))
+            for wire in inner_wires:
+                # Project wire vertices onto tangent and vertical axes to
+                # get true in-plane extents (bbox extents are axis-aligned
+                # and can't represent tilted-wall rectangles correctly).
+                wv = [(v.X, v.Y, v.Z) for v in wire.Vertexes]
+                if not wv:
+                    continue
+                t_projs = [p[0]*lx + p[1]*ly + p[2]*lz for p in wv]
+                width = max(t_projs) - min(t_projs)
+                z_projs = [p[2] for p in wv]
+                height = max(z_projs) - min(z_projs)
+
+                # Center on the face plane (midpoint in tangent + vertical,
+                # preserving the face's plane offset).
+                t_mid = (max(t_projs) + min(t_projs)) / 2
+                z_mid = (max(z_projs) + min(z_projs)) / 2
+                # Face plane offset along exterior normal.
+                n_mid = face_proj
+                cx = t_mid * lx + n_mid * ex_nx
+                cy = t_mid * ly + n_mid * ex_ny
+                cz = z_mid
+
+                key = (round(cx, 2), round(cy, 2), round(cz, 2),
+                       round(width, 2), round(height, 2))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                openings.append(Opening(
+                    center_x=cx, center_y=cy, center_z=cz,
+                    width=width, height=height,
+                    wall_thickness=wall_thickness,
+                    normal_x=ex_nx, normal_y=ex_ny, normal_z=ex_nz,
+                    exterior_offset=exterior_offset,
+                    wall_label=wall_label,
+                ))
 
     logger.info("Found %d openings in '%s'", len(openings), wall_label)
     return openings
@@ -355,15 +382,7 @@ def find_all_openings(doc, wall_group=None):
         shape = wall_obj.Shape
         if not shape.Solids:
             continue
-        try:
-            normal, ext_offset = detect_wall_normal(shape)
-        except ValueError:
-            logger.debug("Skipping '%s' — cannot detect wall normal", wall_obj.Label)
-            continue
-
-        openings = find_openings(shape, normal, wall_label=wall_obj.Label)
-        for op in openings:
-            op.exterior_offset = ext_offset
+        openings = find_openings(shape, wall_label=wall_obj.Label)
         all_openings.extend(openings)
 
     logger.info("Total openings found: %d across %d walls", len(all_openings), len(walls))
@@ -444,7 +463,6 @@ def catalog_masters(doc, group_names=None):
             height_axis = 2
             width_axis = [i for i in remaining if i != 2][0]
         else:
-            # Z is depth — height is the larger of remaining
             if dims[remaining[0]] >= dims[remaining[1]]:
                 height_axis = remaining[0]
                 width_axis = remaining[1]
@@ -452,10 +470,45 @@ def catalog_masters(doc, group_names=None):
                 height_axis = remaining[1]
                 width_axis = remaining[0]
 
+        # Match dimensions = the smaller end face along the depth axis.
+        # Window masters have a frame on the exterior side and a pane that
+        # protrudes through the wall opening on the other side; the pane's
+        # end face is what has to fit the opening, not the frame bbox.
+        # For masters without a recessed pane (plain boxes, doors), both
+        # end faces equal the bbox and pane_width/height fall back to that.
+        pane_w, pane_h = dims[width_axis], dims[height_axis]
+        bbox_mins = [bb.XMin, bb.YMin, bb.ZMin]
+        bbox_maxs = [bb.XMax, bb.YMax, bb.ZMax]
+        min_area = float('inf')
+        for face in obj.Shape.Faces:
+            if face.Surface.__class__.__name__ != "Plane":
+                continue
+            try:
+                fn = face.normalAt(0, 0)
+            except Exception:
+                continue
+            n_comps = (fn.x, fn.y, fn.z)
+            # Faces aligned with the depth axis (normal along ±axis)
+            if abs(n_comps[depth_axis]) < 0.95:
+                continue
+            # Only end faces: at the master's bbox extreme in depth
+            fbb = face.BoundBox
+            f_min = [fbb.XMin, fbb.YMin, fbb.ZMin][depth_axis]
+            f_max = [fbb.XMax, fbb.YMax, fbb.ZMax][depth_axis]
+            if (abs(f_min - bbox_mins[depth_axis]) > 0.05 and
+                abs(f_max - bbox_maxs[depth_axis]) > 0.05):
+                continue
+            f_dims = [fbb.XLength, fbb.YLength, fbb.ZLength]
+            area = f_dims[width_axis] * f_dims[height_axis]
+            if area < min_area and area > 0:
+                min_area = area
+                pane_w = f_dims[width_axis]
+                pane_h = f_dims[height_axis]
+
         catalog.append(MasterInfo(
             label=obj.Label,
-            width=dims[width_axis],
-            height=dims[height_axis],
+            width=pane_w,
+            height=pane_h,
             depth=depth,
             depth_axis=depth_axis,
             bbox_min=(bb.XMin, bb.YMin, bb.ZMin),

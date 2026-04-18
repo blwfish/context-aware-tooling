@@ -564,10 +564,16 @@ def process_part(spec, printer='m7_pro', raise_amount=MODEL_RAISE,
 # FreeCAD-document helpers (for visualization)
 # ---------------------------------------------------------------------------
 
-def add_result_to_doc(result, doc=None, prefix=None):
+def add_result_to_doc(result, doc=None, prefix=None, diagnostics=True,
+                      grid_spacing=4.0, verbose=True):
     """Create FreeCAD document objects for an oriented mesh + supports + raft.
 
     Handy for visually inspecting in the FreeCAD GUI.
+
+    When `diagnostics` is True (default), also runs the orphan-facet
+    diagnostic and adds one Mesh::Feature per orphan classification so you
+    can see which downward-facing facets received no support.  Pass
+    `diagnostics=False` to skip.
     """
     if doc is None:
         doc = FreeCAD.ActiveDocument
@@ -588,5 +594,17 @@ def add_result_to_doc(result, doc=None, prefix=None):
         raft_obj = doc.addObject("Part::Feature", f"{prefix}_raft")
         raft_obj.Shape = result.raft_shape
 
+    out = {"mesh": mesh_obj, "supports": sup_obj, "raft": raft_obj,
+           "orphans": {}, "orphan_report": None}
+
+    if diagnostics:
+        import diagnostics as _diag
+        report = _diag.find_orphan_facets(result, grid_spacing=grid_spacing)
+        out["orphan_report"] = report
+        out["orphans"] = _diag.add_orphans_to_doc(
+            result, report, doc=doc, prefix=prefix)
+        if verbose:
+            print(_diag.summarize(report))
+
     doc.recompute()
-    return {"mesh": mesh_obj, "supports": sup_obj, "raft": raft_obj}
+    return out

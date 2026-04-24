@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 *.FCBak
+
+# Local scaffolding (not tracked in repo)
+CLAUDE.md
+.claude/
+.claude.json
